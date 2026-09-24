@@ -7,6 +7,10 @@
   平面上做连续（相邻区间无重叠、无缺口）分段直线最小二乘拟合；
 * 分段数 1..3，每段至少 3 个点，分段罚项为模块常量 :data:`SEGMENT_PENALTY`，
   全局最优由动态规划穷举所有合法切分得到。
+* 通过仅关键字参数 ``timestamps`` / ``valid`` / ``min_window_samples`` 支持
+  不规则采样与缺测：按**实际时间窗口**（锚点 t0、步长 dt、窗长 m*dt 的半开
+  区间）取相邻窗均值之差，任一窗有效样本覆盖不足时该差分记为缺失；均匀完整
+  输入的统计量与定频路径一致。
 
 注意：拟合斜率只是对该批离线数据 log-log 形态的经验描述，不是任何临床结论或
 硬件指标保证；本模块也不宣称完整兼容任何行业标准。
@@ -15,6 +19,7 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -79,13 +84,20 @@ class AllanPoint:
     """单个聚类大小 m 的 Allan 统计结果。
 
     属性:
-        m: 聚类大小（样本数）。
+        m: 聚类大小（以采样间隔 dt 为单位的窗口长度，即窗长 m*dt 秒）。
         tau: 聚类时间 m * dt，单位秒。
-        variance: 重叠 Allan 方差；差分样本数 < 2 时为 None（无法估计）。
+        variance: 重叠 Allan 方差；有效差分样本数 < 2 时为 None（无法估计）。
         adev: Allan 标准差 ``sqrt(variance)``；variance 为 None 时同为 None。
-        count: 实际参与计算的相邻等长块均值差分样本数，即 ``max(0, N - 2*m + 1)``；
-            m 过大（2*m > N）时为 0。
+        count: 实际参与统计的**有效**相邻窗均值差分样本数，即
+            ``max(0, N - 2*m + 1)`` 减去落在数据末端/因缺测被丢弃的对数；
+            定频完整输入下就是 ``max(0, N - 2*m + 1)``。
         eligible_for_fit: count >= 20 且 variance > 0。
+        positions: 网格上枚举过的相邻窗对位置总数（含有效对与缺失对）。
+            定频路径恒等于 ``max(0, N - 2*m + 1)``；时间窗口路径恒等于
+            ``max(0, floor((t_last - t0)/dt) - 2*m + 2)``，
+            即 ``count + missing``。
+        missing: 覆盖不足（某一窗有效样本数 < min_window_samples）或落在
+            末端半窗之外而缺失的窗对数；定频完整输入下为 0。
     """
 
     m: int
@@ -94,6 +106,8 @@ class AllanPoint:
     adev: float | None
     count: int
     eligible_for_fit: bool
+    positions: int = 0
+    missing: int = 0
 
 
 @dataclass(frozen=True)
@@ -208,7 +222,8 @@ def _is_real(x: object) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 
 
-def _validate(samples: object, dt: object, cluster_sizes: object):
+def _validate(samples, dt, cluster_sizes, timestamps=None, valid=None,
+              min_window_samples=None):
     if not isinstance(samples, Sequence) or isinstance(
         samples, (str, bytes, bytearray, memoryview)
     ):
@@ -287,19 +302,102 @@ def _validate(samples: object, dt: object, cluster_sizes: object):
             )
         sizes[i] = m
 
-    return values, dt_f, sizes
+    # ---- 不规则采样：时间戳 ----
+    ts: list[float] | None = None
+    if timestamps is not None:
+        if not isinstance(timestamps, Sequence) or isinstance(
+            timestamps, (str, bytes, bytearray, memoryview)
+        ):
+            raise AllanTypeError(
+                "timestamps: expected a finite sequence (list/tuple/...) of real "
+                "numbers aligned with samples"
+            )
+        if len(timestamps) != n:
+            raise AllanValueError(
+                f"timestamps: length {len(timestamps)} != samples length {n}"
+            )
+        ts = [0.0] * n
+        prev = math.nan
+        for i, t in enumerate(timestamps):
+            if not _is_real(t):
+                raise AllanTypeError(
+                    f"timestamps[{i}]: expected int/finite-float "
+                    "(bool/str/complex rejected)"
+                )
+            ft = float(t)
+            if not math.isfinite(ft):
+                raise AllanValueError(
+                    f"timestamps[{i}]: must be finite (NaN/Infinity rejected)"
+                )
+            if i > 0 and not ft > prev:
+                # 相等与倒退一并拒绝（严格递增），错误可定位到后一个下标。
+                raise AllanValueError(
+                    f"timestamps[{i}]: timestamps must be strictly increasing, "
+                    f"got {ft!r} after {prev!r}"
+                )
+            ts[i] = ft
+            prev = ft
+
+    # ---- 缺测标志 ----
+    flags: list[bool] | None = None
+    if valid is not None:
+        if not isinstance(valid, Sequence) or isinstance(
+            valid, (str, bytes, bytearray, memoryview)
+        ):
+            raise AllanTypeError(
+                "valid: expected a finite sequence (list/tuple/...) of bool flags "
+                "aligned with samples"
+            )
+        if len(valid) != n:
+            raise AllanValueError(
+                f"valid: length {len(valid)} != samples length {n}"
+            )
+        flags = [False] * n
+        for i, f in enumerate(valid):
+            # 有效标志只接受真正的 bool（0/1 等 int 不隐式转换，避免误传）。
+            if not isinstance(f, bool):
+                raise AllanTypeError(
+                    f"valid[{i}]: validity flag must be a bool "
+                    f"(int 0/1 is not accepted implicitly)"
+                )
+            flags[i] = f
+
+    # ---- 每窗最少有效样本数 ----
+    min_count: int | None = None
+    if min_window_samples is not None:
+        if isinstance(min_window_samples, bool) or not isinstance(
+            min_window_samples, int
+        ):
+            raise AllanTypeError(
+                "min_window_samples: expected an int (bool/float rejected)"
+            )
+        if min_window_samples < 1:
+            raise AllanValueError(
+                "min_window_samples: must be >= 1, got "
+                f"{min_window_samples}"
+            )
+        min_count = min_window_samples
+
+    return values, dt_f, sizes, ts, flags, min_count
 
 
 # ---------------------------------------------------------------------------
-# 重叠 Allan 方差（累积和实现）
+# 重叠 Allan 方差
+#
+# 两条计算路径：
+#   * _allan_points_uniform —— 定频完整数据，前缀和一次构造、各 m 复用；
+#   * _allan_points_windowed —— 给定时间戳/有效标志时按实际时间窗口取窗内
+#     有效样本均值，覆盖不足的窗对记为缺失。
 # ---------------------------------------------------------------------------
 
 
-def _allan_points(values: Sequence[float], dt: float, sizes: Sequence[int]):
+def _centered_cumsum(values: Sequence[float]):
+    """去全局偏置后返回 (centered, prefix_cumsum)；均值用 fsum 精确求和。
+
+    相邻窗均值之差对整体加常数数学不变，去偏置可避免大基线信号在差分三项
+    相减时灾难性抵消。
+    """
     n = len(values)
-
-    # 先去除恒定偏置：相邻块均值之差对整体加常数数学不变，去偏置可避免大基线
-    # （如 1e9 + 小噪声）在前缀和三项相减时灾难性抵消。均值用 fsum 精确求和。
     try:
         mean = math.fsum(values) / n
     except OverflowError:
@@ -310,22 +408,26 @@ def _allan_points(values: Sequence[float], dt: float, sizes: Sequence[int]):
     if not math.isfinite(mean):
         raise AllanValueError("sample mean is not finite; inputs out of float64 range")
     centered = [v - mean for v in values]
-
-    # 样本前缀累积和 C[k] = sum(centered[0:k])，float64 顺序累加。
     cum = [0.0] * (n + 1)
     acc = 0.0
     for i, v in enumerate(centered):
         acc += v
         cum[i + 1] = acc
+    return centered, cum
 
-    cm = cum
+
+def _allan_points_uniform(values: Sequence[float], dt: float, sizes: Sequence[int]):
+    """定频完整输入路径（旧行为）：按样本下标分块，全部窗对都完整覆盖。"""
+    n = len(values)
+    _centered, cm = _centered_cumsum(values)
 
     def compute(m: int) -> AllanPoint:
-        count = n - 2 * m + 1
+        count = max(0, n - 2 * m + 1)
         tau = m * dt
+        # 定频完整数据没有“缺失”的窗对；count<2 只是无法做无偏估计。
         if count < 2:
             # 实际差分样本数不会为负：2m>N 时为 0；count=1 时无法做无偏估计。
-            return AllanPoint(m, tau, None, None, max(0, count), False)
+            return AllanPoint(m, tau, None, None, count, False, count, 0)
         # 相邻等长块均值之差：
         #   d_k = mean(w_{k+m}) - mean(w_k)
         #       = (C[k+2m] - 2*C[k+m] + C[k]) / m
@@ -337,15 +439,15 @@ def _allan_points(values: Sequence[float], dt: float, sizes: Sequence[int]):
             )
         except OverflowError:
             q = math.inf
-        variance = q / (2.0 * (count - 1))
-        if not math.isfinite(variance):
+        if not math.isfinite(q):
             raise AllanValueError(
                 f"allan variance overflowed finite float for m={m}; "
                 "input magnitude too large for the computation"
             )
+        variance = q / (2.0 * (count - 1))
         adev = math.sqrt(variance)
         eligible = count >= MIN_DIFFERENCES and variance > 0.0
-        return AllanPoint(m, tau, variance, adev, count, eligible)
+        return AllanPoint(m, tau, variance, adev, count, eligible, count, 0)
 
     # 重复 m 只计算一次；输出顺序与出现次数仍与输入 cluster_sizes 完全一致。
     cache: dict[int, AllanPoint] = {}
@@ -357,6 +459,106 @@ def _allan_points(values: Sequence[float], dt: float, sizes: Sequence[int]):
             cache[m] = pt
         points.append(pt)
     return points
+
+
+def _allan_points_windowed(values, dt: float, sizes, ts, flags, min_required_default):
+    """按实际时间窗口取相邻窗均值之差（不规则采样 / 缺测路径）。
+
+    窗口端点规则（固定）：以首时间戳 t0 为网格锚点，第 k 对窗口为半开区间
+        W1(k) = [t0 + k*dt,       t0 + (k+m)*dt)
+        W2(k) = [t0 + (k+m)*dt,   t0 + (k+2m)*dt)
+    恰落在边界上的样本归入右侧窗口（bisect_left 语义）。枚举到右窗最后一个
+    网格格点起点 t0+(k+2m-1)*dt 不晚于最后一个时间戳为止（均匀完整输入下
+    恰好还原定频路径的 N-2m+1 对）；物理上仍被截断的末端半窗不补零、不外推，
+    交给覆盖阈值判缺失。窗内只统计 valid=True 的样本；任一窗有效样本数
+    < min_window_samples（默认 m）时该差分记为缺失（missing），不计入 count。
+    """
+    n = len(values)
+
+    # 仅有效样本参与：构造其时间戳与（去偏置后的）前缀和，供 O(log n) 取窗均值。
+    if flags is None:
+        use_idx = list(range(n))
+    else:
+        use_idx = [i for i, f in enumerate(flags) if f]
+
+    if use_idx:
+        valid_vals = [values[i] for i in use_idx]
+        _centered, _ = _centered_cumsum(valid_vals)
+        tv = [ts[i] for i in use_idx]
+        cv = [0.0] * (len(use_idx) + 1)
+        acc = 0.0
+        for j, v in enumerate(_centered):
+            acc += v
+            cv[j + 1] = acc
+    else:
+        # 整段缺测：没有任何可用样本，所有窗对均缺失，不需要构造均值。
+        tv = []
+        cv = [0.0]
+
+    t0 = ts[0]
+    t_last = ts[n - 1]
+
+    def compute(m: int) -> AllanPoint:
+        tau = m * dt
+        req = m if min_required_default is None else min_required_default
+        # 末端规则（与定频路径严格兼容）：枚举 k=0..k_last，使右窗的最后一个
+        # 网格格点起点 t0+(k+2m-1)*dt 不晚于 t_last —— 即右窗在数据范围内
+        # 至少“开始了它的最后一格”；物理上仍被截断的半窗交给覆盖阈值
+        # （min_window_samples）判缺失，末端之外不补零、不外推。
+        # floor 前加 1e-9 相对容差，吸收 i*dt 网格的 binary64 舍入
+        # （如 3.99/0.01 = 398.9999...）；容差远小于半格 0.5，不会吞掉真实半窗。
+        span_raw = (t_last - t0) / dt
+        span_steps = math.floor(span_raw + 1e-9 * max(1.0, abs(span_raw)))
+        positions = max(0, span_steps - 2 * m + 2)
+
+        valid_sq: list[float] = []
+        for k in range(positions):
+            # 边界一律直接写成 t0 + j*dt（一次乘法），避免 e0+tau 的二次
+            # 舍入在均匀网格上把恰在边界的样本错分半位。
+            e0 = t0 + k * dt
+            e1 = t0 + (k + m) * dt
+            e2 = t0 + (k + 2 * m) * dt
+            # 半开区间：边界样本归右窗（bisect_left）。
+            i0 = bisect_left(tv, e0)
+            i1 = bisect_left(tv, e1)
+            i2 = bisect_left(tv, e2)
+            n1 = i1 - i0
+            n2 = i2 - i1
+            if n1 < req or n2 < req:
+                continue
+            mean1 = (cv[i1] - cv[i0]) / n1
+            mean2 = (cv[i2] - cv[i1]) / n2
+            valid_sq.append((mean2 - mean1) ** 2)
+
+        count = len(valid_sq)
+        missing = positions - count
+        if count < 2:
+            return AllanPoint(m, tau, None, None, count, False, positions, missing)
+        try:
+            q = math.fsum(valid_sq)
+        except OverflowError:
+            q = math.inf
+        if not math.isfinite(q):
+            raise AllanValueError(
+                f"allan variance overflowed finite float for m={m}; "
+                "input magnitude too large for the computation"
+            )
+        variance = q / (2.0 * (count - 1))
+        adev = math.sqrt(variance)
+        eligible = count >= MIN_DIFFERENCES and variance > 0.0
+        return AllanPoint(m, tau, variance, adev, count, eligible, positions, missing)
+
+    # 重复 m 只计算一次；输出顺序与出现次数仍与输入 cluster_sizes 完全一致。
+    cache: dict[int, AllanPoint] = {}
+    points: list[AllanPoint] = []
+    for m in sizes:
+        pt = cache.get(m)
+        if pt is None:
+            pt = compute(m)
+            cache[m] = pt
+        points.append(pt)
+    return points
+
 
 
 # ---------------------------------------------------------------------------
@@ -536,27 +738,52 @@ def _fit_piecewise(points: Sequence[AllanPoint]):
 # ---------------------------------------------------------------------------
 
 
-def analyze(samples, dt, cluster_sizes) -> AllanResult:
+def analyze(samples, dt, cluster_sizes, *, timestamps=None, valid=None,
+            min_window_samples=None) -> AllanResult:
     """计算重叠 Allan 方差并做 log-log 连续分段直线分解。
 
     参数:
-        samples: 定频单轴角速率序列，长度 1..8192，元素为 int/float 且有限；
-            bool 元素按类型错误拒绝。
-        dt: 采样周期（秒），int/float、有限且 > 0；bool 拒绝。
+        samples: 单轴角速率序列，长度 1..8192，元素为 int/float 且有限；
+            bool 按类型错误拒绝。
+        dt: 名义采样周期（秒），int/float、有限且 > 0；bool 拒绝。同时是
+            时间窗口网格的步长与聚类时间换算单位（tau=m*dt）。
         cluster_sizes: 聚类大小 m 的有限序列（list/tuple/range），每个为
             真正的 int（bool、float 拒绝）且 m >= 1，长度 <= 8192；允许重复、
             非单调，输出点顺序与输入一致，拟合前去重升序。
+        timestamps: 仅关键字，可选。与 samples 等长的严格递增有限实数序列
+            （秒，单调，不要求均匀）；不给定时走定频路径（旧行为）。
+        valid: 仅关键字，可选。与 samples 等长的真正 bool 序列；False 表示
+            该样本缺测，窗内统计时跳过。可与 timestamps 组合使用。不给定时
+            视为全部有效。
+        min_window_samples: 仅关键字，可选。每个时间窗口要求的最少有效样本
+            数，真正的 int 且 >= 1；默认等于 m（即每个 m*dt 窗至少 m 个有效
+            样本才算充分覆盖）。
+
+    时间窗口规则（``timestamps``/``valid`` 存在时）：
+        网格锚点为首时间戳 t0，第 k 对窗口为半开区间
+        ``[t0+k*dt, t0+(k+m)*dt)`` 与 ``[t0+(k+m)*dt, t0+(k+2m)*dt)``；
+        恰落在边界上的样本归右窗。只枚举右窗末端不晚于最后时间戳的窗对，
+        末端之外的半窗不补零、不外推。任一窗有效样本数 < min_window_samples
+        时该差分记为缺失；``count`` 只计有效差分，``missing`` 为被跳过的对数，
+        ``positions = count + missing``。
 
     返回:
-        AllanResult。无法拟合（可拟合点 < 3，例如常量零方差或短数据）时抛出
-        FitInfeasibleError，其 .points 附带已算好的逐 m 统计。
+        AllanResult。无法拟合（可拟合点 < 3，例如常量零方差或覆盖不足）时
+        抛出 FitInfeasibleError，其 .points 附带已算好的逐 m 统计。
 
     异常:
         AllanTypeError / AllanValueError: 非法输入，信息定位到具体参数与下标。
-        FitInfeasibleError: 证明无满足约束的分段方案。
-        SearchBudgetExhaustedError: 搜索预算耗尽（公开输入边界内不可达）。
+        FitInfeasibleError: 有效统计点不足，证明无满足约束的分段方案。
+        SearchBudgetExhaustedError: 网格/搜索预算耗尽（公开边界内不可达）。
     """
-    values, dt_f, sizes = _validate(samples, dt, cluster_sizes)
-    points = _allan_points(values, dt_f, sizes)
+    values, dt_f, sizes, ts, flags, min_req = _validate(
+        samples, dt, cluster_sizes, timestamps, valid, min_window_samples
+    )
+    if ts is None and flags is None:
+        points = _allan_points_uniform(values, dt_f, sizes)
+    else:
+        if ts is None:
+            ts = [i * dt_f for i in range(len(values))]
+        points = _allan_points_windowed(values, dt_f, sizes, ts, flags, min_req)
     fit = _fit_piecewise(points)
     return AllanResult(tuple(points), fit, dt_f, len(values))
