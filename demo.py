@@ -12,6 +12,7 @@
 不是硬件指标保证。
 """
 
+import math
 import os
 import random
 import sys
@@ -99,5 +100,89 @@ def main():
     print("（以上拒绝均为实际计算路径触发，非预录文本；无异常被吞掉。）")
 
 
+def streaming_demo():
+    """在线累积器演示：长流喂入、随时 query、内存不随历史增长、整块拒绝。"""
+    print("\n" + "=" * 72)
+    print("在线累积器 OnlineAllan：固定 dt 与尺度，feed 任意长度 chunk，随时 query")
+    print("-" * 72)
+
+    # 1) 与批量入口对同一完整前缀一致（N=2048，与上面离线部分同一信号）。
+    samples = build_samples()
+    acc = ad.OnlineAllan(DT, SIZES)
+    for i in range(0, N, 251):  # 素数块喂入
+        acc.feed(samples[i:i + 251])
+    batch = ad.analyze(samples, DT, SIZES)
+    online = acc.query()
+    worst = max(
+        abs(p.variance - rp.variance) / rp.variance
+        for p, rp in zip(online.points, batch.points)
+        if rp.variance
+    )
+    print(f"1) 素数块(251)喂入 N={acc.n_samples}：与 analyze 同前缀逐 m 方差"
+          f"最大相对差 {worst:.3g}，分段断点一致: {online.fit.breakpoints == batch.fit.breakpoints}")
+
+    # 2) 长流：样本数远超批量上限 MAX_SAMPLES=8192，内存不随历史增长。
+    n_long = 40000
+    rng = random.Random(20260923)
+    sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+    acc2 = ad.OnlineAllan(DT, sizes)
+    t0 = time.perf_counter()
+    i = 0
+    primes = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31)
+    k = 0
+    while i < n_long:
+        c = primes[k % len(primes)]
+        k += 1
+        j = min(i + c, n_long)
+        acc2.feed([SIGMA * rng.gauss(0.0, 1.0) + ACCEL * t for t in range(i, j)])
+        i = j
+    elapsed = time.perf_counter() - t0
+    res2 = acc2.query()
+    print(f"2) 长流 N={acc2.n_samples}（>{ad.MAX_SAMPLES} 批量上限），"
+          f"素数块喂入+最终拟合耗时 {elapsed:.2f}s")
+    print(f"   保留滑动样本 {acc2.retained_samples} 个（=2*max(m)，与历史长度无关）")
+    print(f"   拟合 {res2.fit.segment_count} 段：小 tau 斜率 "
+          f"{res2.fit.segments[0].slope:+.3f}（白噪声区理论约 -0.5），"
+          f"大 tau 斜率 {res2.fit.segments[-1].slope:+.3f}（漂移区理论约 +1.0）")
+
+    # 3) 现场用独立双循环公式抽查（与测试同口径，非被测代码路径）。
+    rng2 = random.Random(20260923)
+    short = [SIGMA * rng2.gauss(0.0, 1.0) + ACCEL * t for t in range(600)]
+    acc3 = ad.OnlineAllan(DT, sizes)
+    acc3.feed(short)
+    worst3 = 0.0
+    checked = 0
+    for p in acc3.query_points():
+        if p.variance is None:
+            continue  # 2m > N 的尺度差分数 <2，按契约无法估计（不补零）
+        m = p.m
+        cnt = len(short) - 2 * m + 1
+        tot = 0.0
+        for kk in range(cnt):
+            d = (math.fsum(short[kk + m:kk + 2 * m]) / m
+                 - math.fsum(short[kk:kk + m]) / m)
+            tot += d * d
+        ref = tot / (2.0 * (cnt - 1))
+        worst3 = max(worst3, abs(p.variance - ref) / ref)
+        checked += 1
+    print(f"3) 独立双循环公式抽查（N=600 前缀，{checked} 个可估计尺度）："
+          f"最大相对差 {worst3:.3g}")
+
+    # 4) 失败示例：非法 chunk 整块拒绝，状态不丢；dt/尺度创建后不可改。
+    n0 = acc3.n_samples
+    try:
+        acc3.feed([1.0, 2.0, float("nan"), 4.0])
+    except ad.AllanValueError as exc:
+        print(f"4) 含 NaN 的 chunk -> {type(exc).__name__}: {exc}")
+    print(f"   拒绝后 n_samples 仍为 {acc3.n_samples}（前 2 项未被吃掉: "
+          f"{acc3.n_samples == n0}），可继续正常 feed: "
+          f"消费 {acc3.feed([0.5, -0.5])} 个样本")
+    try:
+        acc3.dt = 0.5
+    except AttributeError:
+        print("   acc.dt = 0.5 -> AttributeError（创建后 dt 不可改；尺度同理）")
+
+
 if __name__ == "__main__":
     main()
+    streaming_demo()
