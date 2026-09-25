@@ -14,12 +14,14 @@
 
 from __future__ import annotations
 
+import array
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 __all__ = [
     "analyze",
+    "AllanAccumulator",
     "AllanPoint",
     "AllanResult",
     "Breakpoint",
@@ -208,28 +210,7 @@ def _is_real(x: object) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 
 
-def _validate(samples: object, dt: object, cluster_sizes: object):
-    if not isinstance(samples, Sequence) or isinstance(
-        samples, (str, bytes, bytearray, memoryview)
-    ):
-        raise AllanTypeError(
-            "samples: expected a finite sequence (list/tuple/...) of real numbers"
-        )
-    if not isinstance(cluster_sizes, Sequence) or isinstance(
-        cluster_sizes, (str, bytes, bytearray, memoryview)
-    ):
-        raise AllanTypeError(
-            "cluster_sizes: expected a finite sequence (list/tuple/range) of ints"
-        )
-
-    n = len(samples)
-    if n == 0:
-        raise AllanValueError("samples: must contain at least 1 sample")
-    if n > MAX_SAMPLES:
-        raise AllanValueError(
-            f"samples: length {n} exceeds interface bound {MAX_SAMPLES}"
-        )
-
+def _validate_dt(dt: object) -> float:
     if not _is_real(dt):
         raise AllanTypeError("dt: expected int/float (bool is not accepted)")
     try:
@@ -240,16 +221,23 @@ def _validate(samples: object, dt: object, cluster_sizes: object):
         raise AllanValueError("dt: must be finite (NaN/Infinity rejected)")
     if dt_f <= 0.0:
         raise AllanValueError(f"dt: must be > 0, got {dt!r}")
+    return dt_f
 
-    k_sizes = len(cluster_sizes)
-    if k_sizes == 0:
-        raise AllanValueError("cluster_sizes: must contain at least 1 cluster size")
-    if k_sizes > MAX_CLUSTER_SIZES:
-        raise AllanValueError(
-            f"cluster_sizes: length {k_sizes} exceeds interface bound "
-            f"{MAX_CLUSTER_SIZES}"
+
+def _validate_samples(samples: object) -> list[float]:
+    if not isinstance(samples, Sequence) or isinstance(
+        samples, (str, bytes, bytearray, memoryview)
+    ):
+        raise AllanTypeError(
+            "samples: expected a finite sequence (list/tuple/...) of real numbers"
         )
-
+    n = len(samples)
+    if n == 0:
+        raise AllanValueError("samples: must contain at least 1 sample")
+    if n > MAX_SAMPLES:
+        raise AllanValueError(
+            f"samples: length {n} exceeds interface bound {MAX_SAMPLES}"
+        )
     values: list[float] = [0.0] * n
     for i, v in enumerate(samples):
         if not _is_real(v):
@@ -265,7 +253,24 @@ def _validate(samples: object, dt: object, cluster_sizes: object):
         if not math.isfinite(fv):
             raise AllanValueError(f"samples[{i}]: value must be finite (NaN/Infinity rejected)")
         values[i] = fv
+    return values
 
+
+def _validate_cluster_sizes(cluster_sizes: object, dt_f: float) -> list[int]:
+    if not isinstance(cluster_sizes, Sequence) or isinstance(
+        cluster_sizes, (str, bytes, bytearray, memoryview)
+    ):
+        raise AllanTypeError(
+            "cluster_sizes: expected a finite sequence (list/tuple/range) of ints"
+        )
+    k_sizes = len(cluster_sizes)
+    if k_sizes == 0:
+        raise AllanValueError("cluster_sizes: must contain at least 1 cluster size")
+    if k_sizes > MAX_CLUSTER_SIZES:
+        raise AllanValueError(
+            f"cluster_sizes: length {k_sizes} exceeds interface bound "
+            f"{MAX_CLUSTER_SIZES}"
+        )
     sizes: list[int] = [0] * k_sizes
     for i, m in enumerate(cluster_sizes):
         if isinstance(m, bool) or not isinstance(m, int):
@@ -286,7 +291,13 @@ def _validate(samples: object, dt: object, cluster_sizes: object):
                 f"cluster_sizes[{i}]: m*dt overflows finite float (m={m}, dt={dt_f})"
             )
         sizes[i] = m
+    return sizes
 
+
+def _validate(samples: object, dt: object, cluster_sizes: object):
+    values = _validate_samples(samples)
+    dt_f = _validate_dt(dt)
+    sizes = _validate_cluster_sizes(cluster_sizes, dt_f)
     return values, dt_f, sizes
 
 
@@ -560,3 +571,183 @@ def analyze(samples, dt, cluster_sizes) -> AllanResult:
     points = _allan_points(values, dt_f, sizes)
     fit = _fit_piecewise(points)
     return AllanResult(tuple(points), fit, dt_f, len(values))
+
+
+# ---------------------------------------------------------------------------
+# 在线累积器（固定 dt 与 cluster_sizes 的流式入口）
+# ---------------------------------------------------------------------------
+
+
+def _neumaier_add(total: float, comp: float, delta: float):
+    """Neumaier 补偿求和：返回新的 (total, comp)，真值恒为 total + comp。"""
+    t = total + delta
+    if abs(total) >= abs(delta):
+        comp += (total - t) + delta
+    else:
+        comp += (delta - t) + total
+    return t, comp
+
+
+class _ScaleState:
+    """单个聚类大小 m 的 O(1) 在线累积状态。"""
+
+    __slots__ = ("tail", "tail_c", "prev", "prev_c", "q", "q_c", "count")
+
+    def __init__(self):
+        # tail: 最近 m 个（去基准）样本之和；prev: 其前 m 个样本之和；
+        # 两者均带 Neumaier 补偿项（*_c）。q: 重叠差分平方的补偿累加。
+        self.tail = 0.0
+        self.tail_c = 0.0
+        self.prev = 0.0
+        self.prev_c = 0.0
+        self.q = 0.0
+        self.q_c = 0.0
+        self.count = 0  # 已累积的相邻块均值差分个数（== max(0, N-2m+1)）
+
+
+def _validate_chunk(chunk: object) -> list[float]:
+    """整块校验 feed 的输入；任何元素非法都抛错，调用方保证此时未改动状态。"""
+    if not isinstance(chunk, Sequence) or isinstance(
+        chunk, (str, bytes, bytearray, memoryview)
+    ):
+        raise AllanTypeError(
+            "chunk: expected a finite sequence (list/tuple/...) of real numbers"
+        )
+    values: list[float] = [0.0] * len(chunk)
+    for i, v in enumerate(chunk):
+        if not _is_real(v):
+            raise AllanTypeError(
+                f"chunk[{i}]: expected int/finite-float (bool/str/complex rejected)"
+            )
+        try:
+            fv = float(v)
+        except OverflowError:
+            raise AllanValueError(
+                f"chunk[{i}]: {v!r} cannot be represented as finite float"
+            ) from None
+        if not math.isfinite(fv):
+            raise AllanValueError(
+                f"chunk[{i}]: value must be finite (NaN/Infinity rejected)"
+            )
+        values[i] = fv
+    return values
+
+
+class AllanAccumulator:
+    """固定 dt 与 cluster_sizes 的在线重叠 Allan 累积器。
+
+    样本可任意分块到达（:meth:`feed`），任意时刻 :meth:`query` 得到与
+    :func:`analyze` 作用于当前完整前缀相同口径的结果（不重排、不补零：
+    尾部不足 2m 的样本不产生差分，只体现为 count 更小）。
+
+    内存只占 O(2*max(m) + K)：一个保存最近 2*max(m) 个去基准样本的环形
+    缓冲，加上每个尺度的常数个累积量；不缓存完整历史，样本总数不受
+    :data:`MAX_SAMPLES` 限制。
+
+    数值稳定性：所有样本先减去首样本作为固定基准（相邻块均值之差对整体
+    加常数数学不变，与离线均值去偏置同效），滑动窗口和与差分平方和均用
+    Neumaier 补偿累加。
+
+    dt 与 cluster_sizes 在创建时校验并冻结（只读属性，不可再赋值）。
+    """
+
+    __slots__ = ("_dt", "_sizes", "_states", "_ring", "_n", "_ref")
+
+    def __init__(self, dt, cluster_sizes):
+        dt_f = _validate_dt(dt)
+        sizes = _validate_cluster_sizes(cluster_sizes, dt_f)
+        self._dt = dt_f
+        self._sizes = tuple(sizes)
+        unique = sorted(set(sizes))
+        self._states = {m: _ScaleState() for m in unique}
+        # 环形缓冲保存最近 2*max(m) 个去基准样本，供各尺度读滑动窗口离队值。
+        self._ring = array.array("d", [0.0]) * (2 * unique[-1])
+        self._n = 0
+        self._ref = 0.0
+
+    @property
+    def dt(self) -> float:
+        """创建时校验后的采样周期（秒），只读。"""
+        return self._dt
+
+    @property
+    def cluster_sizes(self) -> tuple[int, ...]:
+        """创建时校验后的聚类大小（输入顺序的 tuple 副本），只读。"""
+        return self._sizes
+
+    @property
+    def n_samples(self) -> int:
+        """已成功 feed 的样本总数。"""
+        return self._n
+
+    def feed(self, chunk) -> int:
+        """送入一个任意长度的样本块，返回累计样本数。
+
+        整块先校验后应用：任一元素非法（非数值、bool、NaN/Infinity）都抛
+        AllanTypeError/AllanValueError，且块内任何样本都不会被计入（无部分
+        变更）。空块是合法无操作。
+        """
+        values = _validate_chunk(chunk)
+        for v in values:
+            self._push(v)
+        return self._n
+
+    def _push(self, v: float) -> None:
+        i = self._n
+        if i == 0:
+            self._ref = v
+        y = v - self._ref
+        ring = self._ring
+        size = len(ring)
+        # 先在旧环形缓冲上读出各尺度的离队样本并更新累积量，最后才写入新值
+        # （写入位置可能正是最大尺度本步要读的 2m 前旧值）。
+        for m, st in self._states.items():
+            st.tail, st.tail_c = _neumaier_add(st.tail, st.tail_c, y)
+            if i >= m:
+                y_leave = ring[(i - m) % size]
+                st.tail, st.tail_c = _neumaier_add(st.tail, st.tail_c, -y_leave)
+                st.prev, st.prev_c = _neumaier_add(st.prev, st.prev_c, y_leave)
+            if i >= 2 * m:
+                y_old = ring[(i - 2 * m) % size]
+                st.prev, st.prev_c = _neumaier_add(st.prev, st.prev_c, -y_old)
+            if i + 1 >= 2 * m:
+                # 新完成的差分 d_k（k = i+1-2m）：最近 m 个均值减去其前 m 个均值。
+                d = ((st.tail + st.tail_c) - (st.prev + st.prev_c)) / m
+                st.q, st.q_c = _neumaier_add(st.q, st.q_c, d * d)
+                st.count += 1
+        ring[i % size] = y
+        self._n = i + 1
+
+    def query(self) -> AllanResult:
+        """对当前完整前缀给出与 :func:`analyze` 同口径的结果。
+
+        只读累积状态，不改动任何累积量，可任意次调用、可与 feed 交替。
+        可拟合点不足时与离线入口一样抛 :class:`FitInfeasibleError`
+        （其 .points 附带逐 m 统计）。
+        """
+        cache: dict[int, AllanPoint] = {}
+        points: list[AllanPoint] = []
+        for m in self._sizes:
+            pt = cache.get(m)
+            if pt is None:
+                pt = self._point(m)
+                cache[m] = pt
+            points.append(pt)
+        fit = _fit_piecewise(points)
+        return AllanResult(tuple(points), fit, self._dt, self._n)
+
+    def _point(self, m: int) -> AllanPoint:
+        st = self._states[m]
+        count = st.count
+        tau = m * self._dt
+        if count < 2:
+            return AllanPoint(m, tau, None, None, count, False)
+        variance = (st.q + st.q_c) / (2.0 * (count - 1))
+        if not math.isfinite(variance):
+            raise AllanValueError(
+                f"allan variance overflowed finite float for m={m}; "
+                "input magnitude too large for the computation"
+            )
+        adev = math.sqrt(variance)
+        eligible = count >= MIN_DIFFERENCES and variance > 0.0
+        return AllanPoint(m, tau, variance, adev, count, eligible)

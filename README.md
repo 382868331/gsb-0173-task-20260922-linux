@@ -1,26 +1,32 @@
-# 固定速率陀螺仪 Allan 误差分解（离线可复用模块）
+# 固定速率陀螺仪 Allan 误差分解（离线批量 + 在线累积）
 
-对定频采样的单轴角速率离线记录，计算**重叠 Allan 方差**（overlapping Allan
+对定频采样的单轴角速率记录，计算**重叠 Allan 方差**（overlapping Allan
 variance），并在 log(聚类时间)–log(Allan 标准差) 平面上做**连续分段直线**
-分解，用于经验性观察白噪声区、漂移区等形态。
+分解，用于经验性观察白噪声区、漂移区等形态。提供两个入口：
 
-> 拟合得到的斜率只是对**本批离线数据** log-log 形态的经验描述，不命名、不暗示
+- `analyze(samples, dt, cluster_sizes)`：离线批量入口（旧接口，保持不变）；
+- `AllanAccumulator(dt, cluster_sizes)`：**在线累积器**，`feed(chunk)` 接受
+  任意长度分块的长流输入，随时 `query()` 当前完整前缀的同口径结果，
+  内存只占 O(2·max(m) + K)，不缓存完整历史。
+
+> 拟合得到的斜率只是对**本批数据** log-log 形态的经验描述，不命名、不暗示
 > 任何临床结论或硬件指标保证，本模块也不宣称完整兼容任何行业标准；它只实现
 > 本题契约内的数学子集。
 
 ## Python 版本与依赖
 
-- Python **3.14.7**（仅使用标准库：`math`、`dataclasses`、`collections.abc`）。
+- Python **3.14.7**（仅使用标准库：`math`、`array`、`dataclasses`、
+  `collections.abc`）。
 - 安装 Python 后**无需安装任何第三方依赖**，无需网络/账号/硬件/数据库/Docker。
 
 ## 运行命令
 
 ```bash
 # 必要测试（独立参考，不调用被测核心产生期望值）
-python -m unittest discover -s tests -v
+./.venv/bin/python -m unittest discover -s tests -v
 
-# 固定输入演示（确定性合成数据；实测约 0.1 秒内完成，远小于 8 秒预算）
-python demo.py
+# 固定输入演示（确定性合成数据；实测约 5 秒内完成，远小于 90 秒预算）
+./.venv/bin/python demo.py
 ```
 
 ## 公开接口
@@ -61,6 +67,68 @@ result = analyze(samples, dt, cluster_sizes)
 第一个拟合点（`m`、`tau`）。`residuals` 与 `fitted_ms` 对齐，为
 观测 `log(adev)` 减模型值。`objective = sse + (segment_count−1)·SEGMENT_PENALTY`。
 
+## 在线累积器（长流输入）
+
+```python
+from allan_deviation import AllanAccumulator
+
+acc = AllanAccumulator(dt, cluster_sizes)   # 创建时校验并冻结 dt 与尺度
+acc.feed(chunk)                              # 任意长度分块，可反复调用
+result = acc.query()                         # 当前完整前缀的 AllanResult
+```
+
+- `dt`、`cluster_sizes`：校验规则与批量入口相同；创建后**不可修改**
+  （只读属性，赋值抛 `AttributeError`；`cluster_sizes` 返回 tuple 副本，
+  之后改动传入的 list 不影响累积器）。
+- `feed(chunk)`：`chunk` 为任意长度的有限实数序列（空块是合法无操作）。
+  **先整块校验、后应用**：任一元素非法（非数值、bool、NaN/±Infinity）都抛
+  `AllanTypeError`/`AllanValueError`（信息定位到 `chunk[i]`），且块内
+  **任何样本都不会被计入**——失败不留下部分变更。返回累计样本数。
+  样本总数不受 `MAX_SAMPLES` 限制，可远超单次批量上限 8192。
+- `query()`：返回与 `analyze` 作用于当前完整前缀**相同口径**的
+  `AllanResult`（逐 m 方差、有效差分数 `count`、分段拟合）。尾部不足
+  2m 个样本**不补零**，只体现为该尺度的 `count` 更小。`query` 只读
+  累积状态、可任意次调用、可与 `feed` 任意交替；可拟合点不足时与批量
+  入口一样抛 `FitInfeasibleError`（`.points` 附带逐 m 统计）。
+- 只读属性：`dt`、`cluster_sizes`、`n_samples`。
+
+可复现使用路径（确定性合成数据，标准库即可运行）：
+
+```bash
+./.venv/bin/python - <<'EOF'
+import random
+from allan_deviation import AllanAccumulator, analyze
+
+rng = random.Random(20260922)
+samples = [rng.gauss(0.0, 1.0) + 0.01 * i for i in range(2048)]
+sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+acc = AllanAccumulator(0.01, sizes)
+for i in range(0, len(samples), 97):        # 任意分块（97 一块）
+    acc.feed(samples[i:i + 97])
+online = acc.query()
+batch = analyze(samples, 0.01, sizes)        # 旧批量入口保留
+worst = max(abs(a.variance - b.variance) / b.variance
+            for a, b in zip(online.points, batch.points))
+print(f"在线 vs 批量最大相对差: {worst:.3g}")   # 实测 ~1e-14
+print(f"段数: {online.fit.segment_count}, 断点: "
+      f"{[(bp.m, bp.tau) for bp in online.fit.breakpoints]}")
+EOF
+```
+
+失败示例（实际触发，非预录）：
+
+```python
+acc.feed([1.0, 2.0, float("nan")])
+# AllanValueError: chunk[2]: value must be finite (NaN/Infinity rejected)
+# —— 整块拒绝：n_samples 不变，块内前两个合法样本也不会被计入。
+acc.dt = 0.1
+# AttributeError: property 'dt' of 'AllanAccumulator' object has no setter
+```
+
+`./.venv/bin/python demo.py` 的在线段落会现场演示以上两条路径，并用
+tracemalloc 展示历史长度加倍（6 万 → 12 万样本）后累积器内存不再增长。
+
 ## 算法与设计取舍
 
 1. **重叠 Allan 方差**：先对样本做前缀累积和（此前用 `math.fsum` 精确均值
@@ -82,6 +150,15 @@ result = analyze(samples, dt, cluster_sizes)
 5. **无部分变更**：`analyze` 为纯函数，不改写输入、无全局状态；任何错误都
    先于返回抛出。`FitInfeasibleError.points` 附带已算好的逐 m 统计（异常即
    结果的一部分，不属于部分写入）。
+6. **在线累积**：`AllanAccumulator` 对每个新样本以 O(K) 更新——环形缓冲
+   保存最近 `2*max(m)` 个**去基准**样本（基准 = 首个样本；相邻块均值之差
+   对整体加常数数学不变，与离线均值去偏置同效），每个尺度维护"最近 m 个
+   之和 / 其前 m 个之和"两个滑动和与差分平方和，新样本到达时若凑满 2m
+   个则产生一个新差分 `d_k` 并累加 `d_k²`。所有滑动和与平方和均用
+   **Neumaier 补偿累加**；内存 O(2·max(m) + K)，与历史长度无关。
+   `query` 只做 `variance = Σd_k²/(2(count−1))` 与既有的分段拟合，不改动
+   任何累积量；分块方式不影响结果（同一序列按单点、素数块、整块送入，
+   累积状态逐位相同）。
 
 ## 错误语义
 
@@ -108,21 +185,38 @@ result = analyze(samples, dt, cluster_sizes)
 - `variance` 精确为 0 的判定来自浮点精确抵消；非二进制可精确表示的常量
   （如重复的 `0.1`）理论上可能留下 `~1e-16` 相对量级残差，这是 binary64
   表示本身的限制，模块不做"接近 0 就当 0"的隐式钳制。
+- 在线累积器与批量入口的数学定义相同，但浮点求值次序不同（去基准滑动和
+  vs 均值去偏置前缀和），二者不保证逐位一致；测试中在线 `query` 与同一
+  前缀的朴素双循环参考在 O(1) 数据（N≤300）上相对差 `< 1e-12`，与批量
+  `analyze` 的逐 m 方差相对差亦 `< 1e-12`（实测约 1e-14）；大直流偏置
+  分档同批量口径（1e6 基线 `< 1e-9`，1e9 基线 `< 1e-7`）。同一序列不同
+  分块送法则逐位一致。
 
 ## 已知限制
 
-- 只处理单轴、定频、离线序列；不做在线/流式估计、不做多轴相关、不做
-  去趋势、不加窗、不做置信区间或噪声系数换算。
+- 只处理单轴、定频序列；不做多轴相关、去趋势、加窗、置信区间或噪声系数
+  换算；**不做缺测填充**——在线入口假定样本按固定 dt 连续到达，断档需要
+  调用方自行重建累积器；不附带任何传感器在线连接。
+- 在线累积器的尺度集合在创建时固定，之后不能增删 m（需新建实例）；
+  其内存为 O(2·max(m) + K)，`max(m)` 很大时环形缓冲相应占
+  `16·max(m)` 字节，这是"只保留最大尺度所需滑动样本"的固有下界。
 - Allan 方差之外的变体（修正 Allan、Hadamard、时间序列等）未实现。
 - 分段拟合在 log 域进行；零/负方差点被剔除而非替换。
-- `cluster_sizes` 达 8192 且样本达 8192 时计算量为 O(N·K)（约 6.7×10⁷ 次
-  差分级运算），属接口上界规模；短演示不穷举该规模。
+- `cluster_sizes` 达 8192 且样本达 8192 时批量计算量为 O(N·K)（约
+  6.7×10⁷ 次差分级运算），属接口上界规模；在线入口为每样本 O(K)，
+  短演示不穷举该规模。
 - 斜率命名保持中性（"小段/大段斜率"），不映射为临床或硬件保证术语。
 
 ## 文件
 
-- `allan_deviation.py`：本题模块（核心算法与全部数据结构/错误类型）。
-- `tests/test_allan.py`：必要测试；参考实现（朴素窗口求和、itertools
-  枚举分段 + 独立 OLS）与被测核心完全独立，期望值不来自核心。
-- `demo.py`：固定种子（20260922）合成"白噪声 + 恒定漂移"，打印分解结果、
-  经验区间、理论交叉点对照，并真实触发 NaN、bool 类型拒绝与短数据无解边界。
+- `allan_deviation.py`：本题模块（核心算法、在线累积器与全部数据结构/
+  错误类型）。
+- `tests/test_allan.py`：批量入口的必要测试；参考实现（朴素窗口求和、
+  itertools 枚举分段 + 独立 OLS）与被测核心完全独立，期望值不来自核心。
+- `tests/test_online.py`：在线累积器的必要测试；同一合成信号按单点、
+  素数块、整块送入并在每个前缀对照朴素双循环参考，覆盖常量、大直流
+  偏置、2m 边界、非法 chunk 整块拒绝、dt/尺度冻结、query 无状态副作用
+  与内存不随历史增长。
+- `demo.py`：固定种子（20260922）合成"白噪声 + 恒定漂移"，打印离线分解
+  结果、经验区间、理论交叉点对照，并演示在线分块送样、中途查询、长流
+  内存不变，真实触发 NaN、bool 类型拒绝、短数据无解与非法 chunk 边界。

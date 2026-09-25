@@ -16,6 +16,7 @@ import os
 import random
 import sys
 import time
+import tracemalloc
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -97,6 +98,77 @@ def main():
     except ad.FitInfeasibleError as exc:
         print(f"  短数据(N=20, count<20) -> {type(exc).__name__}: {exc.reason}")
     print("（以上拒绝均为实际计算路径触发，非预录文本；无异常被吞掉。）")
+
+    # ==================================================================
+    # 在线累积器：同一信号分块流式送入，随时 query 当前完整前缀
+    # ==================================================================
+    print("\n" + "=" * 72)
+    print("在线累积器 AllanAccumulator：分块送样、随时查询当前前缀")
+    print("=" * 72)
+    acc = ad.AllanAccumulator(DT, SIZES)
+    t0 = time.perf_counter()
+    half = len(samples) // 2
+    acc.feed(samples[:half])           # 先送一半
+    mid = acc.query()
+    print(f"已送入 {acc.n_samples} 个样本即查询：m=1 方差={mid.points[0].variance:.6g} "
+          f"(count={mid.points[0].count})，拟合段数={mid.fit.segment_count}")
+    # 其余按 97 一块送入（块长任意，不必整除、不足窗口的尾部不补零）
+    i = half
+    while i < len(samples):
+        j = min(i + 97, len(samples))
+        acc.feed(samples[i:j])
+        i = j
+    online = acc.query()
+    elapsed_online = time.perf_counter() - t0
+    worst = max(
+        abs(po.variance - pb.variance) / pb.variance
+        for po, pb in zip(online.points, result.points)
+        if pb.variance
+    )
+    print(f"全部 {acc.n_samples} 个样本送完（含中途查询，耗时 {elapsed_online:.3f}s）：")
+    print(f"  与离线 analyze 同一前缀相比：各方差最大相对差 {worst:.3g}，"
+          f"断点一致={online.fit.breakpoints == result.fit.breakpoints}，"
+          f"段数一致={online.fit.segment_count == result.fit.segment_count}")
+
+    # ---- 内存不随历史长度增长（只保留 2*max(m) 滑动样本 + 每尺度累积量）----
+    long_n = 120_000
+    block = 1000
+    rng = random.Random(20260922)
+    acc_long = ad.AllanAccumulator(DT, SIZES)
+
+    def feed_random(blocks):
+        for _ in range(blocks):
+            acc_long.feed([rng.gauss(0.0, 1.0) + ACCEL * k
+                           for k in range(block)])
+
+    feed_random(long_n // (2 * block))  # 预热一半
+    tracemalloc.start()
+    snap0 = tracemalloc.take_snapshot()
+    feed_random(long_n // (2 * block))
+    snap1 = tracemalloc.take_snapshot()
+    tracemalloc.stop()
+    growth = sum(s.size_diff for s in snap1.compare_to(snap0, "filename"))
+    print("-" * 72)
+    print(f"长流验证：累计 {acc_long.n_samples} 个样本（远超批量上限 "
+          f"{ad.MAX_SAMPLES}），环形缓冲仅 {len(acc_long._ring)} 个滑动样本；")
+    print(f"  后一半历史送入前后 tracemalloc 增长 {growth} 字节"
+          f"（历史加倍而内存不增）；m=1 方差={acc_long.query().points[0].variance:.6g}")
+
+    # ---- 边界：非法 chunk 整块拒绝且状态不变；dt/尺度创建后不可改 ----
+    print("-" * 72)
+    print("边界演示（在线入口）：")
+    n_before = acc.n_samples
+    try:
+        acc.feed([1.0, 2.0, float("nan")])
+    except ad.AllanValueError as exc:
+        print(f"  含 NaN 的 chunk -> {type(exc).__name__}: {exc}")
+    print(f"  拒绝后样本数仍为 {acc.n_samples}（要求 {n_before}，块内前两项未被吃掉）："
+          f"{acc.n_samples == n_before}")
+    try:
+        acc.dt = 0.1
+    except AttributeError as exc:
+        print(f"  创建后改 dt -> AttributeError: {exc}")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
