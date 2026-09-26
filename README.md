@@ -1,8 +1,12 @@
-# 固定速率陀螺仪 Allan 误差分解（离线可复用模块）
+# 固定速率陀螺仪 Allan 误差分解与温度补偿（离线可复用模块）
 
 对定频采样的单轴角速率离线记录，计算**重叠 Allan 方差**（overlapping Allan
 variance），并在 log(聚类时间)–log(Allan 标准差) 平面上做**连续分段直线**
 分解，用于经验性观察白噪声区、漂移区等形态。
+
+本版在不改变旧 ``analyze`` 行为的前提下，增加按调用方指定训练区间拟合的
+**常数、一阶、二阶温度多项式**：仅用训练数据求解，再对完整陀螺序列离线补偿；
+Allan 结果分别对原数据/补偿数据以及训练区间/留出区间报告。
 
 > 拟合得到的斜率只是对**本批离线数据** log-log 形态的经验描述，不命名、不暗示
 > 任何临床结论或硬件指标保证，本模块也不宣称完整兼容任何行业标准；它只实现
@@ -13,6 +17,16 @@ variance），并在 log(聚类时间)–log(Allan 标准差) 平面上做**连�
 - Python **3.14.7**（仅使用标准库：`math`、`dataclasses`、`collections.abc`）。
 - 安装 Python 后**无需安装任何第三方依赖**，无需网络/账号/硬件/数据库/Docker。
 
+## venv 准备
+
+Linux 原生 Python 3.14.7 示例（若 `python` 已是 3.14.7，可直接跳过 venv）：
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+python --version  # 应显示 Python 3.14.7
+```
+
 ## 运行命令
 
 ```bash
@@ -21,6 +35,16 @@ python -m unittest discover -s tests -v
 
 # 固定输入演示（确定性合成数据；实测约 0.1 秒内完成，远小于 8 秒预算）
 python demo.py
+
+# 本版温度补偿增量演示（确定性合成数据；实测约 0.1 秒，预算 90 秒）
+python demo_iteration.py
+```
+
+本版验收以以下两条准确命令为准：
+
+```bash
+python -m unittest discover -s tests -v
+python demo_iteration.py
 ```
 
 ## 公开接口
@@ -29,6 +53,38 @@ python demo.py
 from allan_deviation import analyze
 result = analyze(samples, dt, cluster_sizes)
 ```
+
+温度补偿入口：
+
+```python
+from allan_deviation import (
+    fit_temperature_polynomial,
+    analyze_temperature_compensation,
+)
+
+fit = fit_temperature_polynomial(
+    timestamps, gyroscope, temperatures, train_range
+)
+result = analyze_temperature_compensation(
+    timestamps,
+    gyroscope,
+    temperatures,
+    train_range,        # 半开区间 [start, end)
+    cluster_sizes,
+    dt=0.01,
+    holdout_range=[800, 1600],
+)
+```
+
+- `timestamps`、`gyroscope`、`temperatures` 长度必须完全一致；时间戳必须严格
+  递增。高层 Allan 入口还检查相邻间隔与 `dt` 一致。模块不重采样、不外推时间、
+  **不擅自插值**；长度或固定速率不对齐直接拒绝。
+- `train_range=[start,end)` 使用真正的 Python `int`，`bool` 拒绝；训练样本少于
+  3 个、训练温度为常量或设计矩阵列相关时抛 `TemperatureDesignError`。
+- 若训练区间内温度与时间呈仿射完全混淆（如 `temperature=a+b*time`），抛
+  `TemperatureConfoundingError`，避免把时间漂移误解释成独立温漂。
+- `holdout_range` 必须是非空且与训练区间不重叠的半开区间；省略时默认使用训练
+  区间之后到序列末尾。训练拟合改善不会被当作独立验证。
 
 - `samples`：定频单轴角速率序列，长度 **1..8192**（接口上限），元素为
   `int`/`float` 且全部有限；`bool`、`str`、`complex` 等按类型错误拒绝，
@@ -46,6 +102,24 @@ result = analyze(samples, dt, cluster_sizes)
 | `points[i]` | 与输入 `cluster_sizes` 一一对应的 `AllanPoint(m, tau, variance, adev, count, eligible_for_fit)` |
 | `fit` | `FitResult`：`segments`、`breakpoints`、`slopes`、`intercepts`、`sse`、`rmse`、`residuals`、`fitted_ms`、`segment_count`、`objective` |
 | `dt` / `n_samples` | 回显校验后的 dt（转为 float）与样本数 |
+
+`TemperatureFit` 返回：
+
+| 字段 | 含义 |
+|---|---|
+| `temperature_center` / `temperature_scale` | 仅由训练温度极值得到的中心化位置与缩放尺度 |
+| `coefficients` | 缩放温度 `x=(T-center)/scale` 下的 `(c0,c1,c2)` |
+| `residuals` | **仅训练区间**残差，长度为 `end-start` |
+| `predictions` / `compensated` | 对整个输入序列逐点生成的温度预测与 `gyro-prediction` |
+| `train_start` / `train_end` | 回显的半开训练区间 |
+
+`TemperatureCompensationResult` 额外包含：
+
+- `original_training` / `compensated_training`：训练区间原数据与补偿数据的独立
+  Allan 结果；
+- `original_holdout` / `compensated_holdout`：留出区间原数据与补偿数据的独立
+  Allan 结果；
+- `compensated`、`timestamps`、`dt`、`n_samples` 及两个区间边界。
 
 `AllanPoint`：
 
@@ -82,6 +156,14 @@ result = analyze(samples, dt, cluster_sizes)
 5. **无部分变更**：`analyze` 为纯函数，不改写输入、无全局状态；任何错误都
    先于返回抛出。`FitInfeasibleError.points` 附带已算好的逐 m 统计（异常即
    结果的一部分，不属于部分写入）。
+6. **温度补偿 QR**：温度在训练区间中心化、缩放到 `[-1,1]`，设计列为
+   `[1,x,x²]`。使用 Householder QR 与同一正交变换作用于右端项，再回代求解；
+   不构造 `AᵀA` 正规方程。训练残差和整段补偿都由多项式独立代回得到。
+7. **可识别性优先**：常温导致一阶、二阶列不可用，训练样本少于 3 个或设计列
+   秩亏均明确拒绝；温度与时间完全仿射混淆时单独抛
+   `TemperatureConfoundingError`。这些是离线数据可识别性条件，不是硬件故障诊断。
+8. **分开报告**：温度模型只在训练区间拟合；原数据/补偿数据分别调用 Allan，
+   训练区间/留出区间也分别切片计算。切片不做时间对齐修正或插值。
 
 ## 错误语义
 
@@ -94,6 +176,8 @@ result = analyze(samples, dt, cluster_sizes)
 - `FitInfeasibleError`：合格拟合点不足 3 个（常量零方差、短数据等），
   信息说明原因（证明无解）。
 - `SearchBudgetExhaustedError`：搜索预算耗尽（公开边界内不会发生）。
+- `TemperatureDesignError`：训练样本不足、训练温度常量或温度设计矩阵列相关。
+- `TemperatureConfoundingError`：训练区间内温度与时间完全仿射混淆。
 - 以上均继承 `AllanError`。
 
 ## 浮点误差口径（不以宽容差掩盖边界）
@@ -118,6 +202,12 @@ result = analyze(samples, dt, cluster_sizes)
 - `cluster_sizes` 达 8192 且样本达 8192 时计算量为 O(N·K)（约 6.7×10⁷ 次
   差分级运算），属接口上界规模；短演示不穷举该规模。
 - 斜率命名保持中性（"小段/大段斜率"），不映射为临床或硬件保证术语。
+- 温度补偿是**离线数学补偿**：只证明给定记录和指定训练区间上的多项式拟合/残差，
+  不保证真实传感器未来性能、热模型因果性、校准有效期或多轴一致性。
+- 二阶项无法区分与 `[1,x,x²]` 共线的其他未观测原因；留出结果只能检查该批数据，
+  不能替代真实传感器验证。
+- 模块要求调用方给齐等长时间戳、陀螺与温度序列；缺失样本、时间戳错位或非定频
+  数据会被拒绝，不自动插值。
 
 ## 文件
 
@@ -126,3 +216,9 @@ result = analyze(samples, dt, cluster_sizes)
   枚举分段 + 独立 OLS）与被测核心完全独立，期望值不来自核心。
 - `demo.py`：固定种子（20260922）合成"白噪声 + 恒定漂移"，打印分解结果、
   经验区间、理论交叉点对照，并真实触发 NaN、bool 类型拒绝与短数据无解边界。
+- `demo_iteration.py`：本版温度补偿演示。现场构造已知二阶温漂与确定性噪声，
+  QR 拟合后对整段补偿，分开打印训练/留出 Allan，并实际触发温度-时间完全混淆与
+  常温秩亏拒绝；无等待、无预录答案，实测约 0.1 秒（90 秒预算内）。
+- `tests/test_temperature.py`：独立多项式代回核对系数/残差，覆盖留出独立报告、
+  时间戳错位、样本不足、常温退化、温度-时间混淆反例，以及 list/tuple/切片输入
+  不改变拟合结果。

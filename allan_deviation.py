@@ -20,6 +20,8 @@ from dataclasses import dataclass
 
 __all__ = [
     "analyze",
+    "fit_temperature_polynomial",
+    "analyze_temperature_compensation",
     "AllanPoint",
     "AllanResult",
     "Breakpoint",
@@ -30,6 +32,11 @@ __all__ = [
     "AllanValueError",
     "FitInfeasibleError",
     "SearchBudgetExhaustedError",
+    "TemperatureFitError",
+    "TemperatureDesignError",
+    "TemperatureConfoundingError",
+    "TemperatureFit",
+    "TemperatureCompensationResult",
     "MAX_SAMPLES",
     "MAX_CLUSTER_SIZES",
     "MIN_DIFFERENCES",
@@ -170,6 +177,55 @@ class AllanTypeError(AllanError, TypeError):
 
 class AllanValueError(AllanError, ValueError):
     """参数取值非法（含 NaN/Infinity、越界、空序列等），信息可定位到参数。"""
+
+
+@dataclass(frozen=True)
+class TemperatureFit:
+    """训练区间上的二阶温度多项式离线拟合结果。
+
+    模型使用中心化且缩放后的温度 ``x=(temperature-center)/scale``：
+    ``gyro = c0 + c1*x + c2*x**2 + residual``。
+    """
+
+    temperature_center: float
+    temperature_scale: float
+    coefficients: tuple[float, float, float]
+    residuals: tuple[float, ...]
+    predictions: tuple[float, ...]
+    compensated: tuple[float, ...]
+    train_start: int
+    train_end: int
+
+
+@dataclass(frozen=True)
+class TemperatureCompensationResult:
+    """原数据与温度补偿数据在训练/未来留出区间上的 Allan 对照结果。"""
+
+    temperature_fit: TemperatureFit
+    compensated: tuple[float, ...]
+    timestamps: tuple[float, ...]
+    train_start: int
+    train_end: int
+    holdout_start: int
+    holdout_end: int
+    original_training: AllanResult
+    compensated_training: AllanResult
+    original_holdout: AllanResult
+    compensated_holdout: AllanResult
+    dt: float
+    n_samples: int
+
+
+class TemperatureFitError(AllanValueError):
+    """温度补偿输入不满足拟合契约的基类。"""
+
+
+class TemperatureDesignError(TemperatureFitError):
+    """温度设计矩阵列不足、列相关或训练样本不足。"""
+
+
+class TemperatureConfoundingError(TemperatureFitError):
+    """温度与时间仿射完全混淆，温度系数不能作因果解释。"""
 
 
 class FitInfeasibleError(AllanError):
@@ -528,6 +584,276 @@ def _fit_piecewise(points: Sequence[AllanPoint]):
         fitted_ms=tuple(p.m for p in ordered),
         segment_count=best_p,
         objective=best_obj,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 二阶温度多项式补偿（QR 求解，离线子集）
+# ---------------------------------------------------------------------------
+
+_QR_RANK_TOLERANCE = 1e-12
+
+
+def _validate_real_sequence(values: object, name: str, n: int | None = None) -> list[float]:
+    if not isinstance(values, Sequence) or isinstance(
+        values, (str, bytes, bytearray, memoryview)
+    ):
+        raise AllanTypeError(f"{name}: expected a finite sequence of real numbers")
+    if n is not None and len(values) != n:
+        raise AllanValueError(
+            f"{name}: length {len(values)} does not align with gyroscope length {n}"
+        )
+    result: list[float] = []
+    for i, value in enumerate(values):
+        if not _is_real(value):
+            raise AllanTypeError(
+                f"{name}[{i}]: expected int/float (bool/str/complex rejected)"
+            )
+        fvalue = float(value)
+        if not math.isfinite(fvalue):
+            raise AllanValueError(f"{name}[{i}]: value must be finite")
+        result.append(fvalue)
+    return result
+
+
+def _validate_index_range(value: object, name: str, n: int) -> tuple[int, int]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != 2:
+        raise AllanTypeError(f"{name}: expected a [start, end] pair")
+    start, end = value
+    if isinstance(start, bool) or not isinstance(start, int):
+        raise AllanTypeError(f"{name}[0]: start must be an int (bool rejected)")
+    if isinstance(end, bool) or not isinstance(end, int):
+        raise AllanTypeError(f"{name}[1]: end must be an int (bool rejected)")
+    if not (0 <= start < end <= n):
+        raise AllanValueError(
+            f"{name}: expected 0 <= start < end <= {n}, got [{start}, {end})"
+        )
+    return start, end
+
+
+def _qr_decompose(matrix: list[list[float]]):
+    """返回方阵 R（就地 Householder 变换后的上三角）和 Householder 向量。
+
+    调用方随后使用同一组变换作用于右端项，因此不保存/不假设正规方程。
+    """
+    rows = len(matrix)
+    cols = len(matrix[0])
+    work = [row[:] for row in matrix]
+    vectors: list[tuple[int, list[float]]] = []
+    diagonals: list[float] = []
+    for col in range(cols):
+        vector = [0.0] * rows
+        for row in range(col, rows):
+            vector[row] = work[row][col]
+        norm = math.sqrt(math.fsum(v * v for v in vector))
+        if norm == 0.0:
+            diagonals.append(0.0)
+            vectors.append((col, vector))
+            continue
+        sign = -1.0 if vector[col] < 0.0 else 1.0
+        vector[col] += sign * norm
+        vnorm_sq = math.fsum(v * v for v in vector)
+        if vnorm_sq > 0.0:
+            for jcol in range(col, cols):
+                dot = math.fsum(vector[k] * work[k][jcol] for k in range(col, rows))
+                factor = 2.0 * dot / vnorm_sq
+                for row in range(col, rows):
+                    work[row][jcol] -= factor * vector[row]
+        diagonals.append(work[col][col])
+        vectors.append((col, vector))
+    return work, vectors, diagonals
+
+
+def _apply_q_transpose(vectors: Sequence[tuple[int, list[float]]], rhs: list[float]) -> list[float]:
+    y = rhs[:]
+    rows = len(rhs)
+    for col, vector in vectors:
+        vnorm_sq = math.fsum(v * v for v in vector)
+        if vnorm_sq == 0.0:
+            continue
+        dot = math.fsum(vector[k] * y[k] for k in range(col, rows))
+        factor = 2.0 * dot / vnorm_sq
+        for row in range(col, rows):
+            y[row] -= factor * vector[row]
+    return y
+
+
+def _back_substitute(r: Sequence[Sequence[float]], y: Sequence[float]) -> list[float]:
+    cols = len(r[0])
+    coefficients = [0.0] * cols
+    for i in range(cols - 1, -1, -1):
+        tail = math.fsum(r[i][j] * coefficients[j] for j in range(i + 1, cols))
+        coefficients[i] = (y[i] - tail) / r[i][i]
+    return coefficients
+
+
+def _qr_solve(design: Sequence[Sequence[float]], rhs: Sequence[float],
+              rank_scale: float) -> list[float]:
+    r, vectors, diagonals = _qr_decompose([list(row) for row in design])
+    threshold = _QR_RANK_TOLERANCE * max(1.0, rank_scale)
+    for col, diagonal in enumerate(diagonals):
+        if abs(diagonal) <= threshold:
+            raise TemperatureDesignError(
+                f"temperature design matrix is rank-deficient at column {col}; "
+                "need independent constant, first-order and second-order temperature terms"
+            )
+    y = _apply_q_transpose(vectors, list(rhs))
+    return _back_substitute(r, y)
+
+
+def _temperature_design(value: float) -> tuple[float, float, float]:
+    return 1.0, value, value * value
+
+
+def _reject_temperature_time_confounding(train_t: Sequence[float],
+                                         train_x: Sequence[float]) -> None:
+    design = [[1.0, x] for x in train_x]
+    r, vectors, diagonals = _qr_decompose(design)
+    if abs(diagonals[1]) <= _QR_RANK_TOLERANCE:
+        return
+    y = _apply_q_transpose(vectors, list(train_t))
+    coefficients = _back_substitute(r, y)
+    time_span = max(train_t) - min(train_t)
+    residual_scale = time_span if time_span > 0.0 else 1.0
+    max_residual = max(
+        abs(train_t[i] - (coefficients[0] + coefficients[1] * train_x[i]))
+        for i in range(len(train_t))
+    )
+    if max_residual <= _QR_RANK_TOLERANCE * residual_scale:
+        raise TemperatureConfoundingError(
+            "temperature is exactly confounded with time in the training interval; "
+            "temperature coefficients are not identifiable independently of time drift"
+        )
+
+
+def fit_temperature_polynomial(timestamps, gyro, temperatures, train_range) -> TemperatureFit:
+    """仅用训练区间拟合 ``c0+c1*x+c2*x**2``，并补偿整段陀螺序列。
+
+    半开区间 ``train_range=[start,end)``。时间戳只按样本位置逐点对齐；长度不一致
+    或非严格递增均拒绝，本函数不做任何插值。
+    """
+    gyro_values = _validate_real_sequence(gyro, "gyro")
+    n = len(gyro_values)
+    if n == 0:
+        raise AllanValueError("gyro: must contain at least 1 sample")
+    if n > MAX_SAMPLES:
+        raise AllanValueError(f"gyro: length {n} exceeds interface bound {MAX_SAMPLES}")
+    timestamp_values = _validate_real_sequence(timestamps, "timestamps", n)
+    temperature_values = _validate_real_sequence(temperatures, "temperatures", n)
+    for i in range(1, n):
+        if not timestamp_values[i] > timestamp_values[i - 1]:
+            raise AllanValueError(
+                f"timestamps[{i}]: timestamps must be strictly increasing; no interpolation is performed"
+            )
+    start, end = _validate_index_range(train_range, "train_range", n)
+    count = end - start
+    if count < 3:
+        raise TemperatureDesignError(
+            f"train_range: need at least 3 rows for constant/first/second terms, got {count}"
+        )
+
+    train_temperature = temperature_values[start:end]
+    tmin, tmax = min(train_temperature), max(train_temperature)
+    temperature_center = (tmin + tmax) / 2.0
+    temperature_scale = (tmax - tmin) / 2.0
+    if temperature_scale <= 0.0:
+        raise TemperatureDesignError(
+            "temperatures: training temperature is constant; first/second-order columns are unavailable"
+        )
+    train_x = [(v - temperature_center) / temperature_scale for v in train_temperature]
+    train_t = timestamp_values[start:end]
+    _reject_temperature_time_confounding(train_t, train_x)
+
+    design = [_temperature_design(x) for x in train_x]
+    rhs = gyro_values[start:end]
+    coefficients = _qr_solve(design, rhs, 1.0)
+    predictions: list[float] = []
+    compensated: list[float] = []
+    for temperature, observation in zip(temperature_values, gyro_values):
+        x = (temperature - temperature_center) / temperature_scale
+        prediction = coefficients[0] + coefficients[1] * x + coefficients[2] * x * x
+        predictions.append(prediction)
+        compensated.append(observation - prediction)
+    train_residuals = tuple(
+        gyro_values[start + i] - predictions[start + i] for i in range(count)
+    )
+    return TemperatureFit(
+        temperature_center=temperature_center,
+        temperature_scale=temperature_scale,
+        coefficients=tuple(coefficients),
+        residuals=train_residuals,
+        predictions=tuple(predictions),
+        compensated=tuple(compensated),
+        train_start=start,
+        train_end=end,
+    )
+
+
+def analyze_temperature_compensation(timestamps, gyro, temperatures, train_range,
+                                     cluster_sizes, dt=None, holdout_range=None):
+    """拟合并对原/补偿数据分别计算训练区间与留出区间的重叠 Allan 统计。"""
+    gyro_values = _validate_real_sequence(gyro, "gyro")
+    n = len(gyro_values)
+    if n == 0:
+        raise AllanValueError("gyro: must contain at least 1 sample")
+    if n > MAX_SAMPLES:
+        raise AllanValueError(f"gyro: length {n} exceeds interface bound {MAX_SAMPLES}")
+    timestamp_values = _validate_real_sequence(timestamps, "timestamps", n)
+    _validate_real_sequence(temperatures, "temperatures", n)
+    start, end = _validate_index_range(train_range, "train_range", n)
+    if holdout_range is None:
+        if end >= n:
+            raise AllanValueError(
+                "holdout_range: no samples remain after train_range; specify a non-empty disjoint interval"
+            )
+        holdout = (end, n)
+    else:
+        holdout = _validate_index_range(holdout_range, "holdout_range", n)
+    h0, h1 = holdout
+    if max(start, h0) < min(end, h1):
+        raise AllanValueError("holdout_range must not overlap train_range")
+
+    if dt is None:
+        if n < 2:
+            raise AllanValueError("dt: cannot infer sample period from one timestamp")
+        dt_value = (timestamp_values[-1] - timestamp_values[0]) / (n - 1)
+    else:
+        if not _is_real(dt):
+            raise AllanTypeError("dt: expected int/float (bool is not accepted)")
+        dt_value = float(dt)
+    if not math.isfinite(dt_value) or dt_value <= 0.0:
+        raise AllanValueError("dt: must be finite and > 0")
+    _validate(gyro_values, dt_value, cluster_sizes)
+    for i in range(1, n):
+        measured = timestamp_values[i] - timestamp_values[i - 1]
+        tolerance = 1e-12 * max(1.0, abs(measured), abs(dt_value))
+        if abs(measured - dt_value) > tolerance:
+            raise AllanValueError(
+                f"timestamps[{i}]: fixed-rate spacing {measured!r} does not match dt {dt_value!r}; "
+                "resampling/interpolation is not performed"
+            )
+
+    fit = fit_temperature_polynomial(
+        timestamp_values, gyro_values, temperatures, (start, end)
+    )
+    original_training = analyze(gyro_values[start:end], dt_value, cluster_sizes)
+    compensated_training = analyze(list(fit.compensated[start:end]), dt_value, cluster_sizes)
+    original_holdout = analyze(gyro_values[h0:h1], dt_value, cluster_sizes)
+    compensated_holdout = analyze(list(fit.compensated[h0:h1]), dt_value, cluster_sizes)
+    return TemperatureCompensationResult(
+        temperature_fit=fit,
+        compensated=fit.compensated,
+        timestamps=tuple(timestamp_values),
+        train_start=start,
+        train_end=end,
+        holdout_start=h0,
+        holdout_end=h1,
+        original_training=original_training,
+        compensated_training=compensated_training,
+        original_holdout=original_holdout,
+        compensated_holdout=compensated_holdout,
+        dt=dt_value,
+        n_samples=n,
     )
 
 
