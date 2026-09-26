@@ -20,16 +20,23 @@ from dataclasses import dataclass
 
 __all__ = [
     "analyze",
+    "fit_temperature_compensation",
+    "analyze_with_temperature",
     "AllanPoint",
     "AllanResult",
     "Breakpoint",
     "Segment",
     "FitResult",
+    "TemperatureFit",
+    "TemperatureAllanResult",
+    "AllanSubsetReport",
+    "SplitAllanReport",
     "AllanError",
     "AllanTypeError",
     "AllanValueError",
     "FitInfeasibleError",
     "SearchBudgetExhaustedError",
+    "TemperatureFitError",
     "MAX_SAMPLES",
     "MAX_CLUSTER_SIZES",
     "MIN_DIFFERENCES",
@@ -155,6 +162,56 @@ class AllanResult:
     n_samples: int
 
 
+@dataclass(frozen=True)
+class TemperatureFit:
+    """训练区间上的离线二次温度模型与补偿序列。
+
+    模型为 ``prediction = c0 + c1*u + c2*u**2``，其中
+    ``u = (temperature - center) / scale``。常温数据退化为常数项模型，
+    ``coefficients`` 仍返回三元组，一次、二次系数为 0。
+    """
+
+    center: float
+    scale: float
+    coefficients: tuple[float, float, float]
+    residuals: tuple[float, ...]
+    compensated_samples: tuple[float, ...]
+    train_indices: tuple[int, ...]
+    term_count: int
+    sse: float
+    rmse: float
+
+
+@dataclass(frozen=True)
+class AllanSubsetReport:
+    """一个连续区间上的 Allan 点；若分段拟合无解则 fit 为 None。"""
+
+    start_index: int
+    end_index: int
+    points: tuple[AllanPoint, ...]
+    fit: FitResult | None
+    infeasible_reason: str | None
+
+
+@dataclass(frozen=True)
+class SplitAllanReport:
+    """同一区间上原数据与温度补偿数据的并列 Allan 结果。"""
+
+    original: AllanSubsetReport | None
+    compensated: AllanSubsetReport | None
+
+
+@dataclass(frozen=True)
+class TemperatureAllanResult:
+    """温度拟合及训练/留出区间分别计算的 Allan 结果。"""
+
+    temperature_fit: TemperatureFit
+    training: SplitAllanReport
+    holdout: SplitAllanReport | None
+    dt: float
+    n_samples: int
+
+
 # ---------------------------------------------------------------------------
 # 错误类型
 # ---------------------------------------------------------------------------
@@ -197,6 +254,10 @@ class SearchBudgetExhaustedError(AllanError):
         super().__init__(f"search budget exhausted: used={used}, budget={budget}")
         self.used = used
         self.budget = budget
+
+
+class TemperatureFitError(AllanError):
+    """温度模型无法被唯一拟合（数据不足、温度列相关或温度与时间完全混淆）。"""
 
 
 # ---------------------------------------------------------------------------
@@ -560,3 +621,322 @@ def analyze(samples, dt, cluster_sizes) -> AllanResult:
     points = _allan_points(values, dt_f, sizes)
     fit = _fit_piecewise(points)
     return AllanResult(tuple(points), fit, dt_f, len(values))
+
+
+# ---------------------------------------------------------------------------
+# 离线温度补偿（二次多项式，Householder QR；非在线标定）
+# ---------------------------------------------------------------------------
+
+_SEQUENCE_TYPES = (str, bytes, bytearray, memoryview)
+
+
+def _flatten_chunks(values, name: str):
+    """接受扁平实数序列或由连续块组成的序列，块边界不参与拟合。"""
+    if not isinstance(values, Sequence) or isinstance(values, _SEQUENCE_TYPES):
+        raise AllanTypeError(f"{name}: expected a finite sequence or sequence chunks")
+    if not values:
+        return values
+    if not isinstance(values[0], Sequence) or isinstance(values[0], _SEQUENCE_TYPES):
+        return values
+
+    flattened = []
+    for chunk_index, chunk in enumerate(values):
+        if not isinstance(chunk, Sequence) or isinstance(chunk, _SEQUENCE_TYPES):
+            raise AllanTypeError(
+                f"{name}[{chunk_index}]: chunks must be finite real-number sequences"
+            )
+        flattened.extend(chunk)
+    return flattened
+
+
+def _validate_real_sequence(values, name: str, expected_len: int | None = None):
+    if not isinstance(values, Sequence) or isinstance(
+        values, (str, bytes, bytearray, memoryview)
+    ):
+        raise AllanTypeError(f"{name}: expected a finite sequence of real numbers")
+    if expected_len is not None and len(values) != expected_len:
+        raise AllanValueError(
+            f"{name}: length {len(values)} does not align with required length "
+            f"{expected_len}; interpolation is not performed"
+        )
+    result = []
+    for i, value in enumerate(values):
+        if not _is_real(value):
+            raise AllanTypeError(
+                f"{name}[{i}]: expected int/float (bool/str/complex rejected)"
+            )
+        fvalue = float(value)
+        if not math.isfinite(fvalue):
+            raise AllanValueError(
+                f"{name}[{i}]: value must be finite (NaN/Infinity rejected)"
+            )
+        result.append(fvalue)
+    return result
+
+
+def _train_bounds(n: int, train_range, timestamps: Sequence[float] | None):
+    if not isinstance(train_range, Sequence) or isinstance(
+        train_range, (str, bytes, bytearray, memoryview)
+    ) or len(train_range) != 2:
+        raise AllanTypeError("train_range: expected (start, end)")
+    start_value, end_value = train_range
+    if not _is_real(start_value) or not _is_real(end_value):
+        raise AllanTypeError(
+            "train_range: start/end must be finite int/float timestamp or index values"
+        )
+    start_float, end_float = float(start_value), float(end_value)
+    if not math.isfinite(start_float) or not math.isfinite(end_float):
+        raise AllanValueError("train_range: start/end must be finite")
+
+    if timestamps is not None:
+        try:
+            start = timestamps.index(start_float)
+            end = timestamps.index(end_float)
+        except ValueError:
+            raise TemperatureFitError(
+                "train_range timestamp was not found exactly; refusing to interpolate"
+            ) from None
+    else:
+        if isinstance(start_value, bool) or isinstance(end_value, bool):
+            raise AllanTypeError("train_range: bool bounds are not accepted")
+        if not isinstance(start_value, int) or not isinstance(end_value, int):
+            raise AllanTypeError(
+                "train_range: without timestamps, inclusive bounds must be Python ints"
+            )
+        start, end = start_value, end_value
+
+    if start < 0 or end < 0 or start >= n or end >= n:
+        raise AllanValueError(f"train_range: bounds must lie within [0,{n - 1}]")
+    if end < start:
+        raise AllanValueError("train_range: end precedes start")
+    return start, end
+
+
+def _qr_solve(matrix, rhs, rank_tolerance=1e-11):
+    """用 Householder QR 解小型超定最小二乘，不构造正规方程。"""
+    a = [list(map(float, row)) for row in matrix]
+    b = list(map(float, rhs))
+    rows = len(a)
+    cols = len(a[0]) if rows else 0
+    if rows < cols or cols == 0:
+        raise TemperatureFitError(
+            f"temperature fit needs at least {cols} independent training rows, got {rows}"
+        )
+
+    for k in range(cols):
+        column_norm = math.sqrt(math.fsum(a[i][k] ** 2 for i in range(k, rows)))
+        scale = max(1.0, max(abs(a[i][k]) for i in range(k, rows)))
+        if column_norm <= rank_tolerance * scale:
+            raise TemperatureFitError(
+                "temperature design columns are correlated; quadratic model is not identifiable"
+            )
+        alpha = -math.copysign(column_norm, a[k][k])
+        v0 = a[k][k] - alpha
+        if v0 == 0.0:
+            raise TemperatureFitError(
+                "temperature design columns are correlated; quadratic model is not identifiable"
+            )
+        v = [0.0] * rows
+        v[k] = v0
+        for i in range(k + 1, rows):
+            v[i] = a[i][k]
+        vnorm_sq = math.fsum(x * x for x in v[k:])
+        for j in range(k, cols):
+            dot = math.fsum(v[i] * a[i][j] for i in range(k, rows))
+            factor = 2.0 * dot / vnorm_sq
+            for i in range(k, rows):
+                a[i][j] -= factor * v[i]
+        dot_b = math.fsum(v[i] * b[i] for i in range(k, rows))
+        factor_b = 2.0 * dot_b / vnorm_sq
+        for i in range(k, rows):
+            b[i] -= factor_b * v[i]
+
+    x = [0.0] * cols
+    for i in range(cols - 1, -1, -1):
+        numerator = b[i] - math.fsum(a[i][j] * x[j] for j in range(i + 1, cols))
+        if abs(a[i][i]) <= rank_tolerance * max(1.0, abs(numerator)):
+            raise TemperatureFitError(
+                "temperature design columns are correlated; quadratic model is not identifiable"
+            )
+        x[i] = numerator / a[i][i]
+    return x
+
+
+def _exact_affine_with_time(values, times):
+    if len(values) < 2:
+        return False
+    n = len(values)
+    mean_t = math.fsum(times) / n
+    mean_v = math.fsum(values) / n
+    stt = math.fsum((t - mean_t) ** 2 for t in times)
+    if stt == 0.0:
+        return False
+    stv = math.fsum((t - mean_t) * (v - mean_v) for t, v in zip(times, values))
+    slope = stv / stt
+    intercept = mean_v - slope * mean_t
+    scale = max(1.0, max(abs(v) for v in values))
+    return all(
+        abs(v - (intercept + slope * t)) <= 1e-12 * scale
+        for t, v in zip(times, values)
+    )
+
+
+def fit_temperature_compensation(
+    samples,
+    temperatures,
+    train_range,
+    timestamps=None,
+) -> TemperatureFit:
+    """在调用方指定训练区间拟合温度模型，并对整段离线序列补偿。
+
+    train_range 在无 timestamps 时为闭区间整数下标；提供 timestamps 时，
+    起点和终点必须在时间戳序列中精确出现。函数绝不插值。
+    """
+    samples = _flatten_chunks(samples, "samples")
+    temperatures = _flatten_chunks(temperatures, "temperatures")
+    gyro = _validate_real_sequence(samples, "samples")
+    n = len(gyro)
+    temp = _validate_real_sequence(temperatures, "temperatures", n)
+    times = None
+    if timestamps is not None:
+        timestamps = _flatten_chunks(timestamps, "timestamps")
+        times = _validate_real_sequence(timestamps, "timestamps", n)
+        if any(times[i + 1] <= times[i] for i in range(n - 1)):
+            raise AllanValueError("timestamps: must be strictly increasing")
+
+    start, end = _train_bounds(n, train_range, times)
+    train_index = list(range(start, end + 1))
+    train_count = len(train_index)
+    if train_count == 0:
+        raise TemperatureFitError("temperature fit training interval is empty")
+
+    train_y = [gyro[i] for i in train_index]
+    train_t = [temp[i] for i in train_index]
+    train_time = [times[i] if times is not None else float(i) for i in train_index]
+
+    center = math.fsum(train_t) / train_count
+    temperature_span = max(train_t) - min(train_t)
+    if temperature_span == 0.0:
+        scale = 1.0
+        design = [[1.0] for _ in train_t]
+        beta = _qr_solve(design, train_y)
+        coefficients = (beta[0], 0.0, 0.0)
+        term_count = 1
+    else:
+        if train_count < 3:
+            raise TemperatureFitError(
+                "quadratic constant/linear/second-order fit needs at least 3 training rows"
+            )
+        if _exact_affine_with_time(train_t, train_time):
+            raise TemperatureFitError(
+                "temperature is exactly confounded with time in the training interval; "
+                "temperature and time effects cannot be separated"
+            )
+        scale = temperature_span / 2.0
+        u_values = [(t - center) / scale for t in train_t]
+        design = [[1.0, u, u * u] for u in u_values]
+        beta = _qr_solve(design, train_y)
+        coefficients = (beta[0], beta[1], beta[2])
+        term_count = 3
+
+    residual_values = []
+    for i in train_index:
+        u = (temp[i] - center) / scale
+        prediction = coefficients[0] + coefficients[1] * u + coefficients[2] * u * u
+        residual_values.append(gyro[i] - prediction)
+
+    compensated = []
+    for i in range(n):
+        u = (temp[i] - center) / scale
+        prediction = coefficients[0] + coefficients[1] * u + coefficients[2] * u * u
+        compensated.append(gyro[i] - prediction)
+
+    sse = math.fsum(r * r for r in residual_values)
+    rmse = math.sqrt(sse / train_count)
+    return TemperatureFit(
+        center=center,
+        scale=scale,
+        coefficients=coefficients,
+        residuals=tuple(residual_values),
+        compensated_samples=tuple(compensated),
+        train_indices=tuple(train_index),
+        term_count=term_count,
+        sse=sse,
+        rmse=rmse,
+    )
+
+
+def _subset_allan(values, dt, cluster_sizes, start, end):
+    subset = values[start:end + 1]
+    try:
+        points = _allan_points(subset, dt, cluster_sizes)
+        fit = _fit_piecewise(points)
+        reason = None
+    except FitInfeasibleError as exc:
+        points = exc.points if exc.points else _allan_points(subset, dt, cluster_sizes)
+        fit = None
+        reason = exc.reason
+    return AllanSubsetReport(
+        start_index=start,
+        end_index=end,
+        points=tuple(points),
+        fit=fit,
+        infeasible_reason=reason,
+    )
+
+
+def analyze_with_temperature(
+    samples,
+    temperatures,
+    dt,
+    cluster_sizes,
+    train_range,
+    timestamps=None,
+) -> TemperatureAllanResult:
+    """拟合并对完整序列补偿，然后分别报告训练段与相邻留出段 Allan。"""
+    samples = _flatten_chunks(samples, "samples")
+    temperatures = _flatten_chunks(temperatures, "temperatures")
+    gyro, dt_f, sizes = _validate(samples, dt, cluster_sizes)
+    temp = _validate_real_sequence(temperatures, "temperatures", len(gyro))
+    times = None
+    if timestamps is not None:
+        timestamps = _flatten_chunks(timestamps, "timestamps")
+        times = _validate_real_sequence(timestamps, "timestamps", len(gyro))
+        if any(times[i + 1] <= times[i] for i in range(len(times) - 1)):
+            raise AllanValueError("timestamps: must be strictly increasing")
+    start, end = _train_bounds(len(gyro), train_range, times)
+
+    if start == 0 and end == len(gyro) - 1:
+        raise AllanValueError(
+            "train_range covers all samples; a nonempty holdout interval is required"
+        )
+    if start == 0:
+        holdout_start, holdout_end = end + 1, len(gyro) - 1
+    elif end == len(gyro) - 1:
+        holdout_start, holdout_end = 0, start - 1
+    else:
+        raise AllanValueError(
+            "train_range must be a prefix or suffix so the holdout interval is contiguous"
+        )
+
+    fit_result = fit_temperature_compensation(
+        gyro, temp, train_range, timestamps
+    )
+    compensated = list(fit_result.compensated_samples)
+    training = SplitAllanReport(
+        original=_subset_allan(gyro, dt_f, sizes, start, end),
+        compensated=_subset_allan(compensated, dt_f, sizes, start, end),
+    )
+    holdout = SplitAllanReport(
+        original=_subset_allan(gyro, dt_f, sizes, holdout_start, holdout_end),
+        compensated=_subset_allan(
+            compensated, dt_f, sizes, holdout_start, holdout_end
+        ),
+    )
+    return TemperatureAllanResult(
+        temperature_fit=fit_result,
+        training=training,
+        holdout=holdout,
+        dt=dt_f,
+        n_samples=len(gyro),
+    )
