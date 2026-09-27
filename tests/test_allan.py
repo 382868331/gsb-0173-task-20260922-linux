@@ -253,6 +253,114 @@ class TestSlopeIdentification(unittest.TestCase):
         self.assertTrue(16 <= res.fit.breakpoints[0].m <= 64)
 
 
+class TestStreaming(unittest.TestCase):
+    def test_arbitrary_batches_match_offline_and_naive(self):
+        samples = synth_mixture(300, 4242, noise_sd=2.0, ramp_per_sample=0.01)
+        sizes = [1, 2, 3, 5, 8, 13, 50, 140]
+        stream = ad.StreamingAllan(0.01, sizes)
+        cuts = [0, 1, 18, 71, 170, 237, len(samples)]
+        final_result = None
+        for left, right in zip(cuts, cuts[1:]):
+            prefix = samples[:right]
+            final_result = stream.append(samples[left:right])
+            try:
+                expected = ad.analyze(prefix, 0.01, sizes)
+                expected_points = expected.points
+            except ad.FitInfeasibleError as exc:
+                expected_points = exc.points
+            self.assertEqual(final_result.n_samples, right)
+            self.assertEqual(
+                [(p.m, p.count) for p in final_result.points],
+                [(p.m, p.count) for p in expected_points])
+            for actual, point in zip(final_result.points, expected_points):
+                if point.variance is None:
+                    self.assertIsNone(actual.variance)
+                    self.assertIsNone(actual.adev)
+                else:
+                    self.assertEqual(actual.variance, point.variance)
+                    self.assertEqual(actual.adev, point.adev)
+
+        for point, m in zip(final_result.points, sizes):
+            ref_variance, ref_count = naive_allan_variance(samples, m)
+            self.assertEqual(point.count, ref_count)
+            self.assertLess(
+                abs(point.variance - ref_variance) / ref_variance, 1e-12)
+
+    def test_cross_batch_windows_counted_once_without_gaps(self):
+        samples = synth_mixture(120, 88)
+        sizes = [3, 7, 20]
+        stream = ad.StreamingAllan(1.0, sizes)
+        cuts = [0, 5, 6, 13, 40, 41, 79, 120]
+        for end in cuts[1:]:
+            result = stream.append(samples[cuts[cuts.index(end) - 1]:end])
+            for point, m in zip(result.points, sizes):
+                expected_count = max(0, end - 2 * m + 1)
+                self.assertEqual(point.count, expected_count, (end, m))
+                if expected_count < 2:
+                    self.assertIsNone(point.variance)
+                    self.assertFalse(point.eligible_for_fit)
+
+    def test_long_scale_unavailable_does_not_block_other_scales(self):
+        samples = synth_mixture(80, 55)
+        stream = ad.StreamingAllan(1.0, [1, 2, 3, 50])
+        result = stream.append(samples)
+        short_point, _, _, long_point = result.points
+        self.assertGreaterEqual(short_point.count, 20)
+        self.assertIsNotNone(short_point.variance)
+        self.assertTrue(short_point.eligible_for_fit)
+        self.assertEqual(long_point.count, 0)
+        self.assertIsNone(long_point.variance)
+        self.assertIsNone(long_point.adev)
+        self.assertFalse(long_point.eligible_for_fit)
+        self.assertIsNotNone(result.fit)
+
+        more = synth_mixture(120, 56)
+        result = stream.append(more)
+        long_point = result.points[3]
+        self.assertGreaterEqual(long_point.count, 20)
+        self.assertIsNotNone(long_point.variance)
+        self.assertIsNotNone(result.fit)
+
+    def test_invalid_batch_is_atomic(self):
+        samples = synth_mixture(80, 12)
+        stream = ad.StreamingAllan(1.0, [1, 4])
+        before = stream.append(samples)
+        with self.assertRaises(ad.AllanValueError):
+            stream.append([1.0, float("nan"), 2.0])
+        self.assertEqual(stream.n_samples, 80)
+        after = stream.snapshot()
+        self.assertEqual(after.n_samples, before.n_samples)
+        self.assertEqual(
+            [p.variance for p in after.points],
+            [p.variance for p in before.points])
+        self.assertEqual(
+            [p.count for p in after.points],
+            [p.count for p in before.points])
+
+    def test_duplicate_sizes_keep_fixed_order(self):
+        stream = ad.StreamingAllan(0.5, [4, 1, 4])
+        result = stream.append(synth_mixture(100, 13))
+        self.assertEqual([p.m for p in result.points], [4, 1, 4])
+        self.assertEqual(result.points[0], result.points[2])
+
+    def test_append_accepts_one_scalar_but_not_bool(self):
+        stream = ad.StreamingAllan(1.0, [1])
+        result = stream.append(2.5)
+        self.assertEqual(result.n_samples, 1)
+        result = stream.append(3.5)
+        self.assertEqual(result.n_samples, 2)
+        self.assertEqual(result.points[0].count, 1)
+        with self.assertRaises(ad.AllanTypeError):
+            stream.append(True)
+
+    def test_huge_always_inactive_scale_does_not_allocate_history(self):
+        stream = ad.StreamingAllan(1e-300, [1, 10 ** 300])
+        result = stream.append([1.0, 2.0])
+        self.assertEqual(result.points[1].count, 0)
+        self.assertIsNone(result.points[1].variance)
+        self.assertEqual(len(stream._history), 3)
+
+
 class TestDuplicatesOrderingAndShortData(unittest.TestCase):
     def test_duplicate_and_nonmonotonic_sizes(self):
         samples = synth_mixture(400, 9)

@@ -2,7 +2,8 @@
 
 本模块只实现题目契约内的数学子集：
 
-* :func:`analyze` 用累积和计算重叠 Allan 方差（overlapping Allan variance）；
+* :func:`analyze` 一次性计算重叠 Allan 方差（overlapping Allan variance）；
+* :class:`StreamingAllan` 在构造时固定全部统计尺度，可持续追加单样本或批次；
 * 对差分样本数 >= 20 且方差严格为正的 (m, sigma) 点，在 log(tau)-log(sigma)
   平面上做连续（相邻区间无重叠、无缺口）分段直线最小二乘拟合；
 * 分段数 1..3，每段至少 3 个点，分段罚项为模块常量 :data:`SEGMENT_PENALTY`，
@@ -20,6 +21,7 @@ from dataclasses import dataclass
 
 __all__ = [
     "analyze",
+    "StreamingAllan",
     "AllanPoint",
     "AllanResult",
     "Breakpoint",
@@ -67,6 +69,7 @@ SEGMENT_PENALTY = 1.0
 # 最多 3 段）的求值次数有确定上界，该预算取该上界之上，因此对合法输入
 # 不可达；保留它是为了在违反公开边界时给出与“证明无解”不同的错误类型。
 _SEARCH_BUDGET = 8 * MAX_CLUSTER_SIZES * MAX_CLUSTER_SIZES
+_ROLLING_SUM_REBUILD_INTERVAL = 32
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +153,7 @@ class AllanResult:
     """analyze 的完整返回值。"""
 
     points: tuple[AllanPoint, ...]
-    fit: FitResult
+    fit: FitResult | None
     dt: float
     n_samples: int
 
@@ -199,6 +202,222 @@ class SearchBudgetExhaustedError(AllanError):
         self.budget = budget
 
 
+class _CompensatedSum:
+    """Neumaier 补偿求和，用于长序列状态递推。"""
+
+    __slots__ = ("value", "compensation")
+
+    def __init__(self):
+        self.value = 0.0
+        self.compensation = 0.0
+
+    def add(self, x: float) -> None:
+        new_value = self.value + x
+        if abs(self.value) >= abs(x):
+            self.compensation += (self.value - new_value + x)
+        else:
+            self.compensation += (x - new_value + self.value)
+        self.value = new_value
+
+
+_MAX_ACTIVE_M = MAX_SAMPLES // 2
+
+
+class _ScaleState:
+    __slots__ = (
+        "m",
+        "current_difference",
+        "square_sum",
+        "square_compensation",
+        "count",
+    )
+
+    def __init__(self, m: int):
+        self.m = m
+        self.current_difference = _CompensatedSum()
+        self.square_sum = 0.0
+        self.square_compensation = 0.0
+        self.count = 0
+
+
+    def add_square(self, value: float) -> None:
+        new_sum = self.square_sum + value
+        if abs(self.square_sum) >= abs(value):
+            self.square_compensation += (self.square_sum - new_sum + value)
+        else:
+            self.square_compensation += (value - new_sum + self.square_sum)
+        self.square_sum = new_sum
+
+    def rebuild_current_difference(
+        self, history: Sequence[float], capacity: int, index: int
+    ) -> None:
+        start = index - 2 * self.m + 1
+        terms = []
+        for offset in range(2 * self.m):
+            value = history[(start + offset) % capacity]
+            if offset < self.m:
+                terms.append(-value)
+            else:
+                terms.append(value)
+        self.current_difference = _CompensatedSum()
+        try:
+            self.current_difference.value = math.fsum(terms)
+        except OverflowError:
+            raise AllanValueError(
+                f"allan difference overflowed finite float for m={self.m}; "
+                "input magnitude too large for the computation"
+            ) from None
+
+
+
+class StreamingAllan:
+    """对预先固定的一组聚类尺度持续追加样本的有状态 Allan 统计。
+
+    每次 :meth:`append` 都返回截至当前全部样本的统计结果。对象只保留最长尺度
+    形成跨批次窗口所必需的 ``2*max(m)+1`` 个原始样本；每个新差分只计数一次。
+
+    较长尺度样本不足时，其 ``variance``/``adev`` 为 ``None``，其他尺度仍正常
+    计算。若合格拟合点不足 3 个，返回结果的 ``fit`` 为 ``None``，这不是异常。
+    """
+
+    def __init__(self, dt, cluster_sizes):
+        self.dt, checked_sizes = _validate_fixed_scale_input(dt, cluster_sizes)
+        self.cluster_sizes: tuple[int, ...] = tuple(checked_sizes)
+        self._active_sizes = {m for m in set(checked_sizes) if m <= _MAX_ACTIVE_M}
+        self.max_m = max(self._active_sizes, default=1)
+        self._states = {m: _ScaleState(m) for m in self._active_sizes}
+        capacity = 2 * self.max_m + 1 if self._active_sizes else 1
+        self._history: list[float | None] = [None] * capacity
+        self._history_capacity = capacity
+        self._n = 0
+        self._reference = 0.0
+        self._total_sum = 0.0
+        self._total_compensation = 0.0
+
+    @property
+    def n_samples(self) -> int:
+        return self._n
+
+    def append(self, samples) -> AllanResult:
+        """追加一个或一批同频样本，并返回到当前为止的全部尺度统计。
+
+        新样本先整体校验，通过后才会更新状态；因此非法批次不会造成部分追加。
+        """
+        batch = _validate_stream_batch(samples, self._n)
+        total_sum = self._total_sum
+        total_compensation = self._total_compensation
+        try:
+            for value in batch:
+                new_sum = total_sum + value
+                if abs(total_sum) >= abs(value):
+                    total_compensation += total_sum - new_sum + value
+                else:
+                    total_compensation += value - new_sum + total_sum
+                total_sum = new_sum
+            mean = (total_sum + total_compensation) / (self._n + len(batch))
+        except OverflowError:
+            raise AllanValueError(
+                "sample magnitudes overflow even the exact mean computation; "
+                "inputs too large for the float64 computation"
+            ) from None
+        if not math.isfinite(mean):
+            raise AllanValueError(
+                "sample mean is not finite; inputs out of float64 range"
+            )
+        saved_history = self._history.copy()
+        saved_states = {
+            m: (
+                state.current_difference.value,
+                state.current_difference.compensation,
+                state.square_sum,
+                state.square_compensation,
+                state.count,
+            )
+            for m, state in self._states.items()
+        }
+        saved_n = self._n
+        saved_reference = self._reference
+        saved_total = (self._total_sum, self._total_compensation)
+        try:
+            for value in batch:
+                self._append_one(value)
+            self._total_sum = total_sum
+            self._total_compensation = total_compensation
+            return self.snapshot()
+        except Exception:
+            for slot, old_value in enumerate(saved_history):
+                self._history[slot] = old_value
+            for m, saved in saved_states.items():
+                state = self._states[m]
+                state.current_difference.value = saved[0]
+                state.current_difference.compensation = saved[1]
+                state.square_sum = saved[2]
+                state.square_compensation = saved[3]
+                state.count = saved[4]
+            self._n = saved_n
+            self._reference = saved_reference
+            self._total_sum, self._total_compensation = saved_total
+            raise
+
+    def snapshot(self) -> AllanResult:
+        """返回当前已接收样本的统计，不改变状态。"""
+        points = tuple(self._point_for(m) for m in self.cluster_sizes)
+        try:
+            fit = _fit_piecewise(points)
+        except FitInfeasibleError:
+            fit = None
+        return AllanResult(points, fit, self.dt, self._n)
+
+    def _append_one(self, raw_value: float) -> None:
+        index = self._n
+        if index == 0:
+            self._reference = raw_value
+        value = raw_value - self._reference
+        self._history[index % self._history_capacity] = value
+
+        for state in self._states.values():
+            m = state.m
+            if index >= 2 * m - 1:
+                if (index - (2 * m - 1)) % _ROLLING_SUM_REBUILD_INTERVAL == 0:
+                    state.rebuild_current_difference(
+                        self._history, self._history_capacity, index
+                    )
+                else:
+                    delta = value
+                    middle = self._history[(index - m) % self._history_capacity]
+                    delta -= middle
+                    delta -= middle
+                    delta += self._history[
+                        (index - 2 * m) % self._history_capacity
+                    ]
+                    state.current_difference.value += delta
+                difference = (
+                    state.current_difference.value
+                    + state.current_difference.compensation
+                ) / m
+                state.add_square(difference * difference)
+                state.count += 1
+
+        self._n += 1
+
+    def _point_for(self, m: int) -> AllanPoint:
+        state = self._states.get(m)
+        count = state.count if state is not None else 0
+        tau = m * self.dt
+        if count < 2:
+            return AllanPoint(m, tau, None, None, count, False)
+        total_squares = state.square_sum + state.square_compensation
+        variance = total_squares / (2.0 * (count - 1))
+        if not math.isfinite(variance):
+            raise AllanValueError(
+                f"allan variance overflowed finite float for m={m}; "
+                "input magnitude too large for the computation"
+            )
+        adev = math.sqrt(variance)
+        eligible = count >= MIN_DIFFERENCES and variance > 0.0
+        return AllanPoint(m, tau, variance, adev, count, eligible)
+
+
 # ---------------------------------------------------------------------------
 # 输入校验
 # ---------------------------------------------------------------------------
@@ -208,28 +427,15 @@ def _is_real(x: object) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 
 
-def _validate(samples: object, dt: object, cluster_sizes: object):
-    if not isinstance(samples, Sequence) or isinstance(
-        samples, (str, bytes, bytearray, memoryview)
+def _validate_sequence(value: object, name: str) -> int:
+    if not isinstance(value, Sequence) or isinstance(
+        value, (str, bytes, bytearray, memoryview)
     ):
-        raise AllanTypeError(
-            "samples: expected a finite sequence (list/tuple/...) of real numbers"
-        )
-    if not isinstance(cluster_sizes, Sequence) or isinstance(
-        cluster_sizes, (str, bytes, bytearray, memoryview)
-    ):
-        raise AllanTypeError(
-            "cluster_sizes: expected a finite sequence (list/tuple/range) of ints"
-        )
+        raise AllanTypeError(f"{name}: expected a finite sequence")
+    return len(value)
 
-    n = len(samples)
-    if n == 0:
-        raise AllanValueError("samples: must contain at least 1 sample")
-    if n > MAX_SAMPLES:
-        raise AllanValueError(
-            f"samples: length {n} exceeds interface bound {MAX_SAMPLES}"
-        )
 
+def _validate_dt(dt: object) -> float:
     if not _is_real(dt):
         raise AllanTypeError("dt: expected int/float (bool is not accepted)")
     try:
@@ -240,7 +446,11 @@ def _validate(samples: object, dt: object, cluster_sizes: object):
         raise AllanValueError("dt: must be finite (NaN/Infinity rejected)")
     if dt_f <= 0.0:
         raise AllanValueError(f"dt: must be > 0, got {dt!r}")
+    return dt_f
 
+
+def _validate_cluster_sizes(cluster_sizes: object, dt_f: float):
+    _validate_sequence(cluster_sizes, "cluster_sizes")
     k_sizes = len(cluster_sizes)
     if k_sizes == 0:
         raise AllanValueError("cluster_sizes: must contain at least 1 cluster size")
@@ -249,22 +459,6 @@ def _validate(samples: object, dt: object, cluster_sizes: object):
             f"cluster_sizes: length {k_sizes} exceeds interface bound "
             f"{MAX_CLUSTER_SIZES}"
         )
-
-    values: list[float] = [0.0] * n
-    for i, v in enumerate(samples):
-        if not _is_real(v):
-            raise AllanTypeError(
-                f"samples[{i}]: expected int/finite-float (bool/str/complex rejected)"
-            )
-        try:
-            fv = float(v)
-        except OverflowError:
-            raise AllanValueError(
-                f"samples[{i}]: {v!r} cannot be represented as finite float"
-            ) from None
-        if not math.isfinite(fv):
-            raise AllanValueError(f"samples[{i}]: value must be finite (NaN/Infinity rejected)")
-        values[i] = fv
 
     sizes: list[int] = [0] * k_sizes
     for i, m in enumerate(cluster_sizes):
@@ -287,76 +481,52 @@ def _validate(samples: object, dt: object, cluster_sizes: object):
             )
         sizes[i] = m
 
-    return values, dt_f, sizes
+    return sizes
 
 
-# ---------------------------------------------------------------------------
-# 重叠 Allan 方差（累积和实现）
-# ---------------------------------------------------------------------------
+def _validate_fixed_scale_input(dt: object, cluster_sizes: object):
+    dt_f = _validate_dt(dt)
+    return dt_f, _validate_cluster_sizes(cluster_sizes, dt_f)
 
 
-def _allan_points(values: Sequence[float], dt: float, sizes: Sequence[int]):
-    n = len(values)
-
-    # 先去除恒定偏置：相邻块均值之差对整体加常数数学不变，去偏置可避免大基线
-    # （如 1e9 + 小噪声）在前缀和三项相减时灾难性抵消。均值用 fsum 精确求和。
-    try:
-        mean = math.fsum(values) / n
-    except OverflowError:
+def _validate_sample_values(samples: object, existing_count: int = 0) -> list[float]:
+    n = _validate_sequence(samples, "samples")
+    if n == 0:
+        raise AllanValueError("samples: must contain at least 1 sample")
+    if existing_count + n > MAX_SAMPLES:
         raise AllanValueError(
-            "sample magnitudes overflow even the exact mean computation; "
-            "inputs too large for the float64 computation"
-        ) from None
-    if not math.isfinite(mean):
-        raise AllanValueError("sample mean is not finite; inputs out of float64 range")
-    centered = [v - mean for v in values]
-
-    # 样本前缀累积和 C[k] = sum(centered[0:k])，float64 顺序累加。
-    cum = [0.0] * (n + 1)
-    acc = 0.0
-    for i, v in enumerate(centered):
-        acc += v
-        cum[i + 1] = acc
-
-    cm = cum
-
-    def compute(m: int) -> AllanPoint:
-        count = n - 2 * m + 1
-        tau = m * dt
-        if count < 2:
-            # 实际差分样本数不会为负：2m>N 时为 0；count=1 时无法做无偏估计。
-            return AllanPoint(m, tau, None, None, max(0, count), False)
-        # 相邻等长块均值之差：
-        #   d_k = mean(w_{k+m}) - mean(w_k)
-        #       = (C[k+2m] - 2*C[k+m] + C[k]) / m
-        # 平方和用 math.fsum 求和，降低大块数时的累加舍入。
+            f"samples: cumulative length {existing_count + n} exceeds interface bound "
+            f"{MAX_SAMPLES}"
+        )
+    values: list[float] = [0.0] * n
+    for i, v in enumerate(samples):
+        if not _is_real(v):
+            raise AllanTypeError(
+                f"samples[{i}]: expected int/finite-float (bool/str/complex rejected)"
+            )
         try:
-            q = math.fsum(
-                ((cm[k + 2 * m] - 2.0 * cm[k + m] + cm[k]) / m) ** 2
-                for k in range(count)
-            )
+            fv = float(v)
         except OverflowError:
-            q = math.inf
-        variance = q / (2.0 * (count - 1))
-        if not math.isfinite(variance):
             raise AllanValueError(
-                f"allan variance overflowed finite float for m={m}; "
-                "input magnitude too large for the computation"
+                f"samples[{i}]: {v!r} cannot be represented as finite float"
+            ) from None
+        if not math.isfinite(fv):
+            raise AllanValueError(
+                f"samples[{i}]: value must be finite (NaN/Infinity rejected)"
             )
-        adev = math.sqrt(variance)
-        eligible = count >= MIN_DIFFERENCES and variance > 0.0
-        return AllanPoint(m, tau, variance, adev, count, eligible)
+        values[i] = fv
+    return values
 
-    # 重复 m 只计算一次；输出顺序与出现次数仍与输入 cluster_sizes 完全一致。
-    cache: dict[int, AllanPoint] = {}
-    points: list[AllanPoint] = []
-    for m in sizes:
-        pt = cache.get(m)
-        if pt is None:
-            pt = compute(m)
-            cache[m] = pt
-        points.append(pt)
-    return points
+
+def _validate_stream_batch(samples: object, existing_count: int) -> list[float]:
+    if _is_real(samples):
+        return _validate_sample_values([samples], existing_count)
+    return _validate_sample_values(samples, existing_count)
+
+
+def _validate(samples: object, dt: object, cluster_sizes: object):
+    dt_f, sizes = _validate_fixed_scale_input(dt, cluster_sizes)
+    return _validate_sample_values(samples), dt_f, sizes
 
 
 # ---------------------------------------------------------------------------
@@ -557,6 +727,8 @@ def analyze(samples, dt, cluster_sizes) -> AllanResult:
         SearchBudgetExhaustedError: 搜索预算耗尽（公开输入边界内不可达）。
     """
     values, dt_f, sizes = _validate(samples, dt, cluster_sizes)
-    points = _allan_points(values, dt_f, sizes)
-    fit = _fit_piecewise(points)
-    return AllanResult(tuple(points), fit, dt_f, len(values))
+    stream = StreamingAllan(dt_f, sizes)
+    result = stream.append(values)
+    if result.fit is None:
+        _fit_piecewise(result.points)
+    return result

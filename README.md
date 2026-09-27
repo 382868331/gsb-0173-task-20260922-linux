@@ -1,8 +1,9 @@
-# 固定速率陀螺仪 Allan 误差分解（离线可复用模块）
+# 固定速率陀螺仪 Allan 误差分解（离线/分批可复用模块）
 
-对定频采样的单轴角速率离线记录，计算**重叠 Allan 方差**（overlapping Allan
+对定频采样的单轴角速率记录，计算**重叠 Allan 方差**（overlapping Allan
 variance），并在 log(聚类时间)–log(Allan 标准差) 平面上做**连续分段直线**
-分解，用于经验性观察白噪声区、漂移区等形态。
+分解。统计尺度可在开始时预先选定，之后逐样本或逐批追加；同一份数据无论如何
+分批，结果都与一次性离线计算一致。
 
 > 拟合得到的斜率只是对**本批离线数据** log-log 形态的经验描述，不命名、不暗示
 > 任何临床结论或硬件指标保证，本模块也不宣称完整兼容任何行业标准；它只实现
@@ -26,8 +27,13 @@ python demo.py
 ## 公开接口
 
 ```python
-from allan_deviation import analyze
+from allan_deviation import analyze, StreamingAllan
 result = analyze(samples, dt, cluster_sizes)
+
+stream = StreamingAllan(dt, cluster_sizes)
+result = stream.append(first_batch)
+result = stream.append(next_batch)  # 也可传入单个 int/float 样本
+result = stream.snapshot()
 ```
 
 - `samples`：定频单轴角速率序列，长度 **1..8192**（接口上限），元素为
@@ -44,8 +50,13 @@ result = analyze(samples, dt, cluster_sizes)
 | 字段 | 含义 |
 |---|---|
 | `points[i]` | 与输入 `cluster_sizes` 一一对应的 `AllanPoint(m, tau, variance, adev, count, eligible_for_fit)` |
-| `fit` | `FitResult`：`segments`、`breakpoints`、`slopes`、`intercepts`、`sse`、`rmse`、`residuals`、`fitted_ms`、`segment_count`、`objective` |
+| `fit` | `FitResult`：`segments`、`breakpoints`、`slopes`、`intercepts`、`sse`、`rmse`、`residuals`、`fitted_ms`、`segment_count`、`objective`；流式追加时若合格点不足 3 个则为 `None` |
 | `dt` / `n_samples` | 回显校验后的 dt（转为 float）与样本数 |
+
+`StreamingAllan(dt, cluster_sizes)` 在构造时固定并校验全部统计尺度；后续不能增删
+尺度，保证每次返回的点顺序稳定。`append(samples)` 的参数可以是一个有限 `int/float`
+（`bool` 拒绝），也可以是一个非空有限序列；累计样本数仍受 8192 上界约束。
+非法批次会在任何状态更新前整体拒绝，不会留下部分追加。
 
 `AllanPoint`：
 
@@ -63,25 +74,29 @@ result = analyze(samples, dt, cluster_sizes)
 
 ## 算法与设计取舍
 
-1. **重叠 Allan 方差**：先对样本做前缀累积和（此前用 `math.fsum` 精确均值
-   去除恒定偏置——相邻块均值之差对整体加常数数学不变，去偏置可避免大基线
-   信号在三项相减时灾难性抵消），每个差分用
-   `d_k = (C[k+2m] − 2·C[k+m] + C[k]) / m` 得到；平方和用 `math.fsum`
-   累加。归一化用无偏因子 `1/(2(count−1))`（有限记录的标准重叠估计写法）。
-2. **拟合点筛选**：差分样本数 `>= 20` 且方差严格为正。常量信号（方差精确
+1. **重叠 Allan 方差**：离线和分批共用同一状态机。状态以首个样本为参考消除
+   恒定偏置；每个尺度维护三点组合 `B[k]=Σw[k+m:k+2m]−Σw[k:k+m]`，新样本用
+   `B[k+1]=B[k]+w[k+2m]−2w[k+m]+w[k]` 更新，并每 32 个差分从保留历史用
+   `math.fsum` 精确重建，避免长序列递推误差累积。平方和用补偿求和，归一化用
+   无偏因子 `1/(2(count−1))`。
+2. **跨批窗口与历史**：新差分只在窗口完整时计数一次；批次边界不特殊处理，因此
+   不会遗漏或重复。对象只保留最长尺度计算下一个三点组合所需的
+   `2*max(m)+1` 个参考样本，以及每个尺度的当前组合、计数和平方和。
+3. **拟合点筛选**：差分样本数 `>= 20` 且方差严格为正。较长尺度样本不足时其
+   `variance/adev/count/eligible_for_fit` 独立表示，不影响其他尺度。常量信号（方差精确
    为 0，如全 0 或全 3.5）在 log 域无定义，不参与拟合。
-3. **分段直线**：点按 `m` 去重升序后，枚举全部**连续**切分（段间无重叠、无
+4. **分段直线**：点按 `m` 去重升序后，枚举全部**连续**切分（段间无重叠、无
    缺口），段数 1..3，每段至少 3 点；段内为闭式 OLS，全局用**动态规划**
    `dp[seg][b] = min_a dp[seg−1][a−1] + SSE(a,b)` 求最小原始 SSE，再以
    `SSE + (p−1)·SEGMENT_PENALTY`（罚项常量 `SEGMENT_PENALTY = 1.0`，
    单位为 log(adev) 残差平方）选择段数。并列时取段数更少者。
-4. **搜索预算 vs 无解**：DP 是对全部合法切分的精确穷举，预算常量
+5. **搜索预算 vs 无解**：DP 是对全部合法切分的精确穷举，预算常量
    （`_SEARCH_BUDGET`，8·K² 量级）取公开输入边界理论求值上界之上，因此对
    合法输入**不可达**；若预算耗尽抛 `SearchBudgetExhaustedError`（无法证明
    最优），与已证明不存在合法切分的 `FitInfeasibleError` 严格区分。
-5. **无部分变更**：`analyze` 为纯函数，不改写输入、无全局状态；任何错误都
-   先于返回抛出。`FitInfeasibleError.points` 附带已算好的逐 m 统计（异常即
-   结果的一部分，不属于部分写入）。
+6. **无部分变更**：`analyze` 为纯函数；`StreamingAllan.append` 先整体校验并
+   检查累计上界，通过后才更新状态。离线拟合不足 3 点仍抛
+   `FitInfeasibleError`，其 `.points` 附带逐 m 统计；流式快照则返回 `fit=None`。
 
 ## 错误语义
 
@@ -111,8 +126,9 @@ result = analyze(samples, dt, cluster_sizes)
 
 ## 已知限制
 
-- 只处理单轴、定频、离线序列；不做在线/流式估计、不做多轴相关、不做
-  去趋势、不加窗、不做置信区间或噪声系数换算。
+- 只处理单轴、定频序列；支持离线一次输入和固定尺度分批追加，但不做多轴相关、
+  不做去趋势、不加窗、不做置信区间或噪声系数换算。
+- `StreamingAllan` 的统计尺度在构造时固定；追加过程中不能新增或删除尺度。
 - Allan 方差之外的变体（修正 Allan、Hadamard、时间序列等）未实现。
 - 分段拟合在 log 域进行；零/负方差点被剔除而非替换。
 - `cluster_sizes` 达 8192 且样本达 8192 时计算量为 O(N·K)（约 6.7×10⁷ 次
@@ -123,6 +139,7 @@ result = analyze(samples, dt, cluster_sizes)
 
 - `allan_deviation.py`：本题模块（核心算法与全部数据结构/错误类型）。
 - `tests/test_allan.py`：必要测试；参考实现（朴素窗口求和、itertools
-  枚举分段 + 独立 OLS）与被测核心完全独立，期望值不来自核心。
+  枚举分段 + 独立 OLS）与被测核心完全独立，期望值不来自核心；另覆盖任意分批
+  与一次性离线结果一致、跨批窗口、非法批次原子性和未成熟尺度。
 - `demo.py`：固定种子（20260922）合成"白噪声 + 恒定漂移"，打印分解结果、
   经验区间、理论交叉点对照，并真实触发 NaN、bool 类型拒绝与短数据无解边界。

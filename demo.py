@@ -39,9 +39,22 @@ def main():
     result = ad.analyze(samples, DT, SIZES)
     elapsed = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
+    stream = ad.StreamingAllan(DT, SIZES)
+    batch_cuts = (0, 7, 33, 129, 511, len(samples))
+    streamed = None
+    for left, right in zip(batch_cuts, batch_cuts[1:]):
+        streamed = stream.append(samples[left:right])
+    stream_elapsed = time.perf_counter() - t0
+    assert streamed.n_samples == len(samples)
+    for offline_point, streamed_point in zip(result.points, streamed.points):
+        assert offline_point.count == streamed_point.count
+        assert offline_point.variance == streamed_point.variance
+
     print("=" * 72)
     print("固定速率单轴陀螺仪 Allan 误差分解（离线经验分解，非硬件指标保证）")
     print(f"样本数 N={N}, dt={DT}s, 时长={N * DT:.1f}s, 核心计算耗时 {elapsed:.3f}s")
+    print(f"分 5 批追加结果与一次性离线结果完全一致；流式计算耗时 {stream_elapsed:.3f}s")
     print("-" * 72)
     print(f"{'m':>5} {'tau(s)':>10} {'count':>6} {'Allan方差':>14} {'Allan标准差':>14} 入拟合")
     for p in result.points:
