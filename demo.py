@@ -98,6 +98,54 @@ def main():
         print(f"  短数据(N=20, count<20) -> {type(exc).__name__}: {exc.reason}")
     print("（以上拒绝均为实际计算路径触发，非预录文本；无异常被吞掉。）")
 
+    # ======================================================================
+    # 流式/分批统计：固定尺度，持续 append，每次返回截至当前结果
+    # ======================================================================
+    print("\n" + "=" * 72)
+    print("流式（分批）Allan 统计：构造时固定尺度，逐批 append")
+    print("=" * 72)
+    stream_sizes = [1, 2, 4, 16, 64, 256, 512]
+    acc = ad.streaming_allan(DT, stream_sizes)
+    cuts = [0, 3, 100, 300, 513, 1024, 1500, 2048]
+    for lo, hi in zip(cuts[:-1], cuts[1:]):
+        snap = acc.append(samples[lo:hi])
+        line = []
+        for p in snap.points:
+            if not p.computable:
+                line.append(f"m={p.m}:不可算(count={p.count})")
+            else:
+                line.append(f"m={p.m}:σ={p.adev:.3g}")
+        fit_txt = (
+            f"拟合{snap.fit.segment_count}段" if snap.fit is not None
+            else "拟合:样本不足"
+        )
+        print(f"  已接收 {snap.n_samples:>4} 点 | 保留历史 {snap.retained_samples}"
+              f"/{snap.retained_limit} | {fit_txt}")
+        if hi in (100, 2048):
+            print("    " + "; ".join(line))
+
+    # 与一次性离线计算一致（同数据不同批次输入 -> 同一统计）。
+    offline = ad.analyze(samples, DT, stream_sizes)
+    final = acc.snapshot()
+    worst = 0.0
+    for sp, op in zip(final.points, offline.points):
+        worst = max(worst, abs(sp.variance - op.variance) / op.variance)
+    print(f"  与一次性离线 analyze 的方差最大相对差: {worst:.2e}（口径 < 1e-12）")
+
+    # 流式边界：非法批次必须被拒绝且不产生部分变更；close 后拒绝继续 append。
+    n_before = acc.n_samples
+    try:
+        acc.append([1.0, float("inf")])
+    except ad.AllanValueError as exc:
+        print(f"  含 inf 的批次 -> {type(exc).__name__}: {exc}")
+    print(f"  失败批次后样本数仍为 {acc.n_samples}（== {n_before}，无部分变更）")
+    acc.close()
+    try:
+        acc.append([1.0, 2.0])
+    except ad.StreamingClosedError as exc:
+        print(f"  close 后 append -> {type(exc).__name__}: {exc}")
+    print(f"  close 后 snapshot 仍可读：N={acc.snapshot().n_samples}")
+
 
 if __name__ == "__main__":
     main()

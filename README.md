@@ -30,6 +30,16 @@ from allan_deviation import analyze
 result = analyze(samples, dt, cluster_sizes)
 ```
 
+另有**分批/流式**接口（同一套数学，固定尺度、持续接收数据）：
+
+```python
+from allan_deviation import streaming_allan
+acc = streaming_allan(dt, cluster_sizes)   # 构造时预先选定全部统计尺度
+snap = acc.append(batch)                   # 每追加一批，返回截至当前的统计
+snap = acc.snapshot()                      # 只读当前结果，不改变状态
+acc.close()                                # 可选：结束后拒绝再 append
+```
+
 - `samples`：定频单轴角速率序列，长度 **1..8192**（接口上限），元素为
   `int`/`float` 且全部有限；`bool`、`str`、`complex` 等按类型错误拒绝，
   `NaN`/`±Infinity` 按取值错误拒绝。
@@ -46,6 +56,38 @@ result = analyze(samples, dt, cluster_sizes)
 | `points[i]` | 与输入 `cluster_sizes` 一一对应的 `AllanPoint(m, tau, variance, adev, count, eligible_for_fit)` |
 | `fit` | `FitResult`：`segments`、`breakpoints`、`slopes`、`intercepts`、`sse`、`rmse`、`residuals`、`fitted_ms`、`segment_count`、`objective` |
 | `dt` / `n_samples` | 回显校验后的 dt（转为 float）与样本数 |
+
+流式接口返回 `StreamingAllanResult`：
+
+| 字段 | 含义 |
+|---|---|
+| `points[i]` | 与构造时 `cluster_sizes` 一一对应（含重复、原顺序）的 `StreamingAllanPoint` |
+| `fit` | 截至当前数据的 `FitResult`；合格拟合点不足 3 个时为 `None`（原因见 `fit_infeasible_reason`），逐尺度统计照常返回 |
+| `fit_infeasible_reason` | `fit is None` 时的原因字符串，否则为 `None` |
+| `n_samples` / `dt` | 截至当前已接收的样本总数与采样周期 |
+| `retained_samples` / `retained_limit` | 当前/上限保留历史样本数，上限恒为 `2*m_max-1`（`m_max=max(cluster_sizes)`） |
+
+`StreamingAllanPoint` 与 `AllanPoint` 字段一致（`m/tau/variance/adev/count/
+eligible_for_fit`），另含：
+
+- `computable`：该尺度当前是否可做无偏方差估计（`count >= 2`）。样本不够时
+  长尺度**单独**标为 `computable=False`、`variance/adev=None`，其他尺度不受
+  影响；`count` 与 `tau` 始终返回。
+- `n_samples`：该快照对应的累计样本总数。
+
+流式语义（跨批次窗口）：
+
+- 第 `k` 个相邻块均值差分（需要样本 `k .. k+2m-1`）只在其**末端样本到达的
+  那一批**被计入一次；早到的样本仅作为历史保存，因此跨批次窗口**不遗漏、
+  不重复计数**，且 `count(m)=max(0, N-2m+1)` 与分批方式无关。
+- 内部只保留最近 `2*m_max-1` 个去偏置样本（任何未来窗口差分只需这些），
+  内存为 `O(m_max)`，与已接收样本总数无关；平方和用 Neumaier 补偿求和。
+- 同一数据无论切成多少批喂入，结果都与一次性 `analyze` 一致（见误差口径）。
+- `append` 先整体校验批次、再把本批新差分全部算出，任一步失败则累加器
+  状态完全停留在该批之前（无部分变更）。`close()` 后 `append` 抛
+  `StreamingClosedError`，`snapshot()` 仍可读。
+- 流式总样本数**没有** 8192 上限（8192 仅为离线接口的一次性输入边界）；
+  每批必须非空，`dt` 与尺度在构造时固定、之后不可更改。
 
 `AllanPoint`：
 
@@ -94,6 +136,9 @@ result = analyze(samples, dt, cluster_sizes)
 - `FitInfeasibleError`：合格拟合点不足 3 个（常量零方差、短数据等），
   信息说明原因（证明无解）。
 - `SearchBudgetExhaustedError`：搜索预算耗尽（公开边界内不会发生）。
+- `StreamingClosedError`（同时是 `RuntimeError`）：对已 `close()` 的流式
+  累加器继续 `append`。流式批次非法（空批、NaN/Infinity、bool/str 等）复用
+  `AllanTypeError`/`AllanValueError`，错误下标定位到 `batch[i]`。
 - 以上均继承 `AllanError`。
 
 ## 浮点误差口径（不以宽容差掩盖边界）
@@ -105,14 +150,20 @@ result = analyze(samples, dt, cluster_sizes)
   `2^-53` 的输入即使去偏置也无法恢复被 binary64 抹掉的低位。
 - log-log 拟合目标值与**枚举全部切分的独立参考**要求绝对差
   `< 1e-9·max(1,|参考值|)`；断线下标要求完全一致（构造数据无并列）。
+- 流式接口与离线 `analyze`、以及**同一数据不同分批方式**之间，方差相对差
+  `< 1e-12`（实测 O(1) 数据通常 `1e-14~1e-13`，见 demo 打印）；差异仅来自
+  平方和累加顺序（离线 `fsum`、流式 Neumaier 补偿求和）。计数 `count`、
+  `computable`、拟合断线下标要求与离线结果完全一致。
 - `variance` 精确为 0 的判定来自浮点精确抵消；非二进制可精确表示的常量
   （如重复的 `0.1`）理论上可能留下 `~1e-16` 相对量级残差，这是 binary64
   表示本身的限制，模块不做"接近 0 就当 0"的隐式钳制。
 
 ## 已知限制
 
-- 只处理单轴、定频、离线序列；不做在线/流式估计、不做多轴相关、不做
-  去趋势、不加窗、不做置信区间或噪声系数换算。
+- 只处理单轴、定频序列；离线 `analyze` 限一次性 8192 点，流式
+  `streaming_allan` 支持任意总样本数（内存 `O(m_max)`）；不做多轴相关、
+  不做去趋势、不加窗、不做置信区间或噪声系数换算。
+- 流式尺度与 `dt` 在构造时固定；不支持运行中增删尺度或变速采样。
 - Allan 方差之外的变体（修正 Allan、Hadamard、时间序列等）未实现。
 - 分段拟合在 log 域进行；零/负方差点被剔除而非替换。
 - `cluster_sizes` 达 8192 且样本达 8192 时计算量为 O(N·K)（约 6.7×10⁷ 次
@@ -122,7 +173,12 @@ result = analyze(samples, dt, cluster_sizes)
 ## 文件
 
 - `allan_deviation.py`：本题模块（核心算法与全部数据结构/错误类型）。
-- `tests/test_allan.py`：必要测试；参考实现（朴素窗口求和、itertools
+- `tests/test_allan.py`：离线核心必要测试；参考实现（朴素窗口求和、itertools
   枚举分段 + 独立 OLS）与被测核心完全独立，期望值不来自核心。
-- `demo.py`：固定种子（20260922）合成"白噪声 + 恒定漂移"，打印分解结果、
-  经验区间、理论交叉点对照，并真实触发 NaN、bool 类型拒绝与短数据无解边界。
+- `tests/test_streaming.py`：流式接口必要测试；方差期望值复用朴素窗口参考与
+  离线 `analyze`，并用多种分批划分交叉验证跨批窗口不遗漏/不重复、历史保留
+  裁剪、长尺度单独不可计算、非法批次无部分变更与 close 语义。
+- `demo.py`：固定种子（20260922）合成"白噪声 + 恒定漂移"，先打印离线分解、
+  经验区间、理论交叉点对照并触发 NaN/bool/短数据边界，再演示流式分批
+  append（长尺度从不可算到可算、历史保留、与离线一致性）及非法批次/close
+  边界。

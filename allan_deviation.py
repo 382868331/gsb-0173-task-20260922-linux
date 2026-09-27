@@ -7,6 +7,9 @@
   平面上做连续（相邻区间无重叠、无缺口）分段直线最小二乘拟合；
 * 分段数 1..3，每段至少 3 个点，分段罚项为模块常量 :data:`SEGMENT_PENALTY`，
   全局最优由动态规划穷举所有合法切分得到。
+* :class:`StreamingAllan`（工厂 :func:`streaming_allan`）在构造时固定统计尺度，
+  随后逐批 :meth:`~StreamingAllan.append` 样本：跨批次窗口不遗漏、不重复，
+  只保留 ``2*m_max-1`` 个历史样本；样本不足的长尺度单独标记为不可计算。
 
 注意：拟合斜率只是对该批离线数据 log-log 形态的经验描述，不是任何临床结论或
 硬件指标保证；本模块也不宣称完整兼容任何行业标准。
@@ -20,6 +23,11 @@ from dataclasses import dataclass
 
 __all__ = [
     "analyze",
+    "streaming_allan",
+    "StreamingAllan",
+    "StreamingAllanPoint",
+    "StreamingAllanResult",
+    "StreamingClosedError",
     "AllanPoint",
     "AllanResult",
     "Breakpoint",
@@ -155,6 +163,56 @@ class AllanResult:
     n_samples: int
 
 
+@dataclass(frozen=True)
+class StreamingAllanPoint:
+    """流式累加器在某个时刻、单个聚类大小 m 的统计结果。
+
+    字段含义与 :class:`AllanPoint` 一致，并额外给出:
+
+    属性:
+        computable: 是否已有足够样本得到 Allan 方差的无偏估计
+            （``count >= 2``，即已见到 ``>= 2*m+1`` 个样本）。样本不足时
+            ``variance``/``adev`` 为 ``None``，该尺度单独不可计算，不影响
+            其他尺度；``count`` 与 ``tau`` 始终返回。
+        n_samples: 截至当前该累加器已接收的样本总数（所有点相同）。
+    """
+
+    m: int
+    tau: float
+    variance: float | None
+    adev: float | None
+    count: int
+    eligible_for_fit: bool
+    computable: bool
+    n_samples: int
+
+
+@dataclass(frozen=True)
+class StreamingAllanResult:
+    """流式累加器一次快照（append/snapshot 的返回值）。
+
+    属性:
+        points: 与构造时 ``cluster_sizes`` 一一对应、顺序相同的逐尺度统计；
+            包含重复尺度（每个重复各得一份相同结果）。
+        fit: 截至当前数据的分段直线拟合结果；合格点不足 3 个时为 ``None``
+            （原因见 ``fit_infeasible_reason``），此时逐尺度统计照常返回。
+        fit_infeasible_reason: fit 为 None 时的原因字符串；fit 非 None 时为 None。
+        dt: 采样周期（秒）。
+        n_samples: 截至当前接收的样本总数。
+        n_differences_by_m: 去重 m 到当前实际差分样本数的映射快照。
+        retained_samples: 为计算下一批跨批次窗口而保留的样本数（含必要历史）。
+        retained_limit: 保留历史的恒定上限 ``max(0, 2*m_max - 1)``。
+    """
+
+    points: tuple[StreamingAllanPoint, ...]
+    fit: FitResult | None
+    fit_infeasible_reason: str | None
+    dt: float
+    n_samples: int
+    retained_samples: int
+    retained_limit: int
+
+
 # ---------------------------------------------------------------------------
 # 错误类型
 # ---------------------------------------------------------------------------
@@ -166,6 +224,10 @@ class AllanError(Exception):
 
 class AllanTypeError(AllanError, TypeError):
     """参数类型非法（含对整数参数传入 bool）。"""
+
+
+class StreamingClosedError(AllanError, RuntimeError):
+    """对已结束（close）的流式累加器继续 append（区别于取值/类型错误）。"""
 
 
 class AllanValueError(AllanError, ValueError):
@@ -208,28 +270,43 @@ def _is_real(x: object) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool)
 
 
-def _validate(samples: object, dt: object, cluster_sizes: object):
-    if not isinstance(samples, Sequence) or isinstance(
-        samples, (str, bytes, bytearray, memoryview)
+def _check_real_sequence(seq: object, name: str, *, allow_empty: bool = False,
+                         max_len: int | None = None) -> list[float]:
+    """校验一个实数序列并返回其 float 列表（拒绝 bool/NaN/Infinity）。"""
+    if not isinstance(seq, Sequence) or isinstance(
+        seq, (str, bytes, bytearray, memoryview)
     ):
         raise AllanTypeError(
-            "samples: expected a finite sequence (list/tuple/...) of real numbers"
+            f"{name}: expected a finite sequence (list/tuple/range) of real numbers"
         )
-    if not isinstance(cluster_sizes, Sequence) or isinstance(
-        cluster_sizes, (str, bytes, bytearray, memoryview)
-    ):
-        raise AllanTypeError(
-            "cluster_sizes: expected a finite sequence (list/tuple/range) of ints"
-        )
-
-    n = len(samples)
-    if n == 0:
-        raise AllanValueError("samples: must contain at least 1 sample")
-    if n > MAX_SAMPLES:
+    n = len(seq)
+    if n == 0 and not allow_empty:
+        raise AllanValueError(f"{name}: must contain at least 1 value")
+    if max_len is not None and n > max_len:
         raise AllanValueError(
-            f"samples: length {n} exceeds interface bound {MAX_SAMPLES}"
+            f"{name}: length {n} exceeds interface bound {max_len}"
         )
+    values: list[float] = [0.0] * n
+    for i, v in enumerate(seq):
+        if not _is_real(v):
+            raise AllanTypeError(
+                f"{name}[{i}]: expected int/finite-float (bool/str/complex rejected)"
+            )
+        try:
+            fv = float(v)
+        except OverflowError:
+            raise AllanValueError(
+                f"{name}[{i}]: {v!r} cannot be represented as finite float"
+            ) from None
+        if not math.isfinite(fv):
+            raise AllanValueError(
+                f"{name}[{i}]: value must be finite (NaN/Infinity rejected)"
+            )
+        values[i] = fv
+    return values
 
+
+def _check_dt(dt: object) -> float:
     if not _is_real(dt):
         raise AllanTypeError("dt: expected int/float (bool is not accepted)")
     try:
@@ -240,7 +317,16 @@ def _validate(samples: object, dt: object, cluster_sizes: object):
         raise AllanValueError("dt: must be finite (NaN/Infinity rejected)")
     if dt_f <= 0.0:
         raise AllanValueError(f"dt: must be > 0, got {dt!r}")
+    return dt_f
 
+
+def _check_cluster_sizes(cluster_sizes: object, dt_f: float) -> list[int]:
+    if not isinstance(cluster_sizes, Sequence) or isinstance(
+        cluster_sizes, (str, bytes, bytearray, memoryview)
+    ):
+        raise AllanTypeError(
+            "cluster_sizes: expected a finite sequence (list/tuple/range) of ints"
+        )
     k_sizes = len(cluster_sizes)
     if k_sizes == 0:
         raise AllanValueError("cluster_sizes: must contain at least 1 cluster size")
@@ -249,23 +335,6 @@ def _validate(samples: object, dt: object, cluster_sizes: object):
             f"cluster_sizes: length {k_sizes} exceeds interface bound "
             f"{MAX_CLUSTER_SIZES}"
         )
-
-    values: list[float] = [0.0] * n
-    for i, v in enumerate(samples):
-        if not _is_real(v):
-            raise AllanTypeError(
-                f"samples[{i}]: expected int/finite-float (bool/str/complex rejected)"
-            )
-        try:
-            fv = float(v)
-        except OverflowError:
-            raise AllanValueError(
-                f"samples[{i}]: {v!r} cannot be represented as finite float"
-            ) from None
-        if not math.isfinite(fv):
-            raise AllanValueError(f"samples[{i}]: value must be finite (NaN/Infinity rejected)")
-        values[i] = fv
-
     sizes: list[int] = [0] * k_sizes
     for i, m in enumerate(cluster_sizes):
         if isinstance(m, bool) or not isinstance(m, int):
@@ -286,7 +355,13 @@ def _validate(samples: object, dt: object, cluster_sizes: object):
                 f"cluster_sizes[{i}]: m*dt overflows finite float (m={m}, dt={dt_f})"
             )
         sizes[i] = m
+    return sizes
 
+
+def _validate(samples: object, dt: object, cluster_sizes: object):
+    dt_f = _check_dt(dt)
+    values = _check_real_sequence(samples, "samples", max_len=MAX_SAMPLES)
+    sizes = _check_cluster_sizes(cluster_sizes, dt_f)
     return values, dt_f, sizes
 
 
@@ -534,6 +609,252 @@ def _fit_piecewise(points: Sequence[AllanPoint]):
 # ---------------------------------------------------------------------------
 # 公开入口
 # ---------------------------------------------------------------------------
+
+
+class _CompensatedSum:
+    """Neumaier 补偿求和：跨批次累加顺序/分批方式变化时漂移可忽略。"""
+
+    __slots__ = ("total", "comp")
+
+    def __init__(self):
+        self.total = 0.0
+        self.comp = 0.0
+
+    def add(self, x: float) -> None:
+        t = self.total + x
+        if abs(self.total) >= abs(x):
+            self.comp += (self.total - t) + x
+        else:
+            self.comp += (x - t) + self.total
+        self.total = t
+
+    def value(self) -> float:
+        return self.total + self.comp
+
+
+class StreamingAllan:
+    """固定尺度的增量（分批）重叠 Allan 统计累加器。
+
+    构造时固定 ``dt`` 与一组统计尺度 ``cluster_sizes``（允许重复/非单调，
+    输出顺序与构造输入一致），随后用 :meth:`append` 逐批喂入样本。每次
+    append（或随时 :meth:`snapshot`）都返回截至当前全部已接收数据的统计结果。
+
+    * **跨批次窗口不遗漏、不重复**：第 ``k`` 个相邻块均值差分只在其末端样本
+      ``x[k+2m-1]`` 到达的那一批被计入一次；早到的样本只作为历史保存。
+    * **只保留下一批确实需要的历史**：内部仅保留最近
+      ``2*m_max - 1`` 个样本（``m_max=max(cluster_sizes)``），更早的样本对
+      任何未来窗口差分都不再需要，故丢弃。
+    * **长尺度单独不可计算**：样本不足以使某 ``m`` 得到 ``>=2`` 个差分时，
+      该尺度 ``computable=False``、``variance/adev=None``，其他尺度照常返回。
+    * **与离线一致**：同一数据不论分多少批喂入，统计与把全部样本一次性交给
+      :func:`analyze` 的结果在 README 误差口径内一致（平方和用补偿求和）。
+    * **失败无部分变更**：append 的输入先整体校验、新差分先全部算出，任一步
+      失败则累加器状态保持在该批之前，不产生部分写入。
+
+    长度无上限：离线 :func:`analyze` 的 8192 点边界不适用于流式总样本数；
+    内存只与 ``2*m_max`` 成正比，与已接收样本总数无关。
+    """
+
+    def __init__(self, dt, cluster_sizes):
+        dt_f = _check_dt(dt)
+        sizes = _check_cluster_sizes(cluster_sizes, dt_f)
+        self._dt = dt_f
+        self._sizes: tuple[int, ...] = tuple(sizes)
+        # 去重尺度及其在输出中的所有位置（重复尺度共享同一累加状态）。
+        positions: dict[int, list[int]] = {}
+        for i, m in enumerate(self._sizes):
+            positions.setdefault(m, []).append(i)
+        self._positions = {m: tuple(ps) for m, ps in positions.items()}
+        self._unique_ms: tuple[int, ...] = tuple(sorted(positions))
+        self._m_max = max(self._sizes)
+        self._retain = 2 * self._m_max - 1
+        self._n = 0
+        # 以固定中心（首批精确均值）去偏置后的历史样本；窗口差分对加常数
+        # 数学不变，固定中心使跨批结果与分批方式无关且对大基线稳健。
+        self._history: list[float] = []
+        self._center = 0.0
+        self._count: dict[int, int] = {m: 0 for m in self._unique_ms}
+        self._qsum: dict[int, _CompensatedSum] = {
+            m: _CompensatedSum() for m in self._unique_ms
+        }
+        self._closed = False
+
+    # -- 基本属性 ---------------------------------------------------------
+
+    @property
+    def dt(self) -> float:
+        return self._dt
+
+    @property
+    def cluster_sizes(self) -> tuple[int, ...]:
+        """构造时给定的尺度序列（含重复、原顺序）。"""
+        return self._sizes
+
+    @property
+    def n_samples(self) -> int:
+        """截至当前已成功接收的样本总数。"""
+        return self._n
+
+    @property
+    def retained_samples(self) -> int:
+        """当前为未来跨批次窗口保留的历史样本数。"""
+        return len(self._history)
+
+    @property
+    def retained_limit(self) -> int:
+        """保留历史的恒定上限 ``2*m_max - 1``。"""
+        return self._retain
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    # -- 增量喂入 ---------------------------------------------------------
+
+    def append(self, batch) -> StreamingAllanResult:
+        """追加一批样本，返回追加后截至当前的完整统计快照。
+
+        参数:
+            batch: 非空实数序列（list/tuple/range），元素 int/有限 float，
+                bool/NaN/Infinity 拒绝；空批按取值错误拒绝。
+
+        异常:
+            AllanTypeError / AllanValueError: 本批非法，状态保持不变。
+            StreamingClosedError: 累加器已 close。
+        """
+        if self._closed:
+            raise StreamingClosedError(
+                "this StreamingAllan accumulator has been closed; no more append()"
+            )
+        # 流式批次不设 8192 上限（总样本本来就无界）；但必须非空且全部有限。
+        values = _check_real_sequence(batch, "batch", allow_empty=False)
+        self._ingest(values)
+        return self.snapshot()
+
+    def _ingest(self, values: list[float]) -> None:
+        old_n = self._n
+        old_count = self._count
+        if old_n == 0:
+            try:
+                self._center = math.fsum(values) / len(values)
+            except OverflowError:
+                raise AllanValueError(
+                    "batch magnitudes overflow even the exact mean computation; "
+                    "inputs too large for the float64 computation"
+                ) from None
+            if not math.isfinite(self._center):
+                raise AllanValueError(
+                    "batch mean is not finite; inputs out of float64 range"
+                )
+        combined = self._history + [v - self._center for v in values]
+        new_n = old_n + len(values)
+
+        # 对固定中心数据建前缀和；combined 起点对应的全局下标为 offset。
+        offset = old_n - len(self._history)
+        cum = [0.0] * (len(combined) + 1)
+        acc = 0.0
+        for i, v in enumerate(combined):
+            acc += v
+            cum[i + 1] = acc
+
+        # 先把本批所有新差分算到临时累加器，全部成功后才提交，保证原子性。
+        new_q: dict[int, _CompensatedSum] = {}
+        new_count: dict[int, int] = {}
+        for m in self._unique_ms:
+            total_count = max(0, new_n - 2 * m + 1)
+            prev = old_count[m]
+            add = total_count - prev
+            if add > 0:
+                q = _CompensatedSum()
+                # 新完备差分的全局起点 k = prev .. total_count-1（其末端样本
+                # 落在本批）；更早的 k 已在历史批次计过，绝不重复。
+                for k in range(prev, total_count):
+                    j = k - offset
+                    d = (cum[j + 2 * m] - 2.0 * cum[j + m] + cum[j]) / m
+                    dd = d * d
+                    if not math.isfinite(dd):
+                        raise AllanValueError(
+                            f"allan variance overflowed finite float for m={m}; "
+                            "input magnitude too large for the computation"
+                        )
+                    q.add(dd)
+                new_q[m] = q
+            new_count[m] = total_count
+
+        # 提交：合并平方和、更新计数、只保留确实需要的尾部历史。
+        for m, q in new_q.items():
+            self._qsum[m].add(q.value())
+        self._count = new_count
+        self._n = new_n
+        if len(combined) > self._retain:
+            combined = combined[len(combined) - self._retain:]
+        self._history = combined
+
+    # -- 当前结果 ---------------------------------------------------------
+
+    def _build_points(self):
+        n = self._n
+        points: list[StreamingAllanPoint] = [None] * len(self._sizes)  # type: ignore[list-item]
+        fit_points: list[AllanPoint] = []
+        for m in self._unique_ms:
+            count = self._count[m]
+            tau = m * self._dt
+            if count >= 2:
+                variance = self._qsum[m].value() / (2.0 * (count - 1))
+                if not math.isfinite(variance):
+                    raise AllanValueError(
+                        f"allan variance overflowed finite float for m={m}; "
+                        "input magnitude too large for the computation"
+                    )
+                adev = math.sqrt(variance)
+                eligible = count >= MIN_DIFFERENCES and variance > 0.0
+            else:
+                variance = None
+                adev = None
+                eligible = False
+            computable = count >= 2
+            sp = StreamingAllanPoint(
+                m, tau, variance, adev, count, eligible, computable, n
+            )
+            ap = AllanPoint(m, tau, variance, adev, count, eligible)
+            fit_points.append(ap)
+            for pos in self._positions[m]:
+                points[pos] = sp
+        return tuple(points), fit_points
+
+    def snapshot(self) -> StreamingAllanResult:
+        """返回截至当前的统计快照，不改变累加器状态（未喂入数据前亦可调用）。"""
+        points, fit_points = self._build_points()
+        fit = None
+        reason: str | None = None
+        if self._n > 0:
+            try:
+                fit = _fit_piecewise(fit_points)
+            except FitInfeasibleError as exc:
+                reason = exc.reason
+        else:
+            reason = (
+                "no samples appended yet; need at least "
+                f"{MIN_SEGMENT_POINTS} eligible log-log points"
+            )
+        return StreamingAllanResult(
+            points=points,
+            fit=fit,
+            fit_infeasible_reason=reason,
+            dt=self._dt,
+            n_samples=self._n,
+            retained_samples=len(self._history),
+            retained_limit=self._retain,
+        )
+
+    def close(self) -> None:
+        """结束该累加器：之后 append 抛 StreamingClosedError，snapshot 仍可用。"""
+        self._closed = True
+
+
+def streaming_allan(dt, cluster_sizes) -> StreamingAllan:
+    """创建固定尺度的流式 Allan 累加器（:class:`StreamingAllan` 的工厂）。"""
+    return StreamingAllan(dt, cluster_sizes)
 
 
 def analyze(samples, dt, cluster_sizes) -> AllanResult:
